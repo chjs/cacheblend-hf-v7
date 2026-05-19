@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.coverage
+.venv/
+venv/
+
+# Outputs
+benchmarks/musique/logs/
+reports/
+
+# Secrets
+.env

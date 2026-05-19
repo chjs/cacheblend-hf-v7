@@ -1,0 +1,26 @@
+# cacheblend-hf-v7 — slim musique-only distribution.
+# Versions locked to match the v4 reproduction environment.
+#
+# Install order on CPU (Mac for scaffolding test):
+#   pip install torch==2.4.1
+#   pip install -r requirements.txt
+#   pip install -e .
+#
+# Install order on GPU pod (vast.ai pytorch:2.4.1-cuda12.4 image — torch already at correct version):
+#   grep -v -E '^torch(\s|=|$)' requirements.txt > /tmp/reqs-no-torch.txt
+#   pip install -r /tmp/reqs-no-torch.txt
+#   pip install -e .
+
+# --- Core (locked exactly) ---
+torch==2.4.1
+transformers==4.49.0
+accelerate==1.13.0
+huggingface-hub==0.36.2
+tokenizers==0.21.4
+safetensors==0.7.0
+
+# --- Metrics for F1/ROUGE-L (musique original utils.py imports rouge_score) ---
+rouge-score>=0.1.2
+
+# --- numerics ---
+numpy>=2.0,<3.0

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cacheblend"
+version = "0.7.0"
+description = "CacheBlend (EuroSys '25) — HuggingFace Transformers reimplementation, musique-only slim distribution"
+requires-python = ">=3.11,<3.13"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
