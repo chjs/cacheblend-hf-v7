@@ -74,7 +74,7 @@ mkdir -p ~/work && cd ~/work
 ### 2. Clone this repo
 
 ```bash
-git clone https://github.com/<your-account>/cacheblend-hf-v7.git
+git clone https://github.com/chjs/cacheblend-hf-v7.git
 cd cacheblend-hf-v7
 ```
 
@@ -95,7 +95,7 @@ Pick **one** of the two options.
 **Option A — `venv` (lightest, recommended):**
 
 ```bash
-python3.11 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 ```
@@ -111,6 +111,7 @@ conda activate cacheblend
 
 ```bash
 pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu124
+pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 Verify torch sees the A100:
