@@ -1,19 +1,27 @@
 #!/usr/bin/env python
-"""Runner for original YaoJiayi/CacheBlend `blend_musique.py` — UNMODIFIED.
+"""Runner for the musique workload scripts.
 
 This wrapper:
   1. Inserts `_shim/` onto sys.path so `import vllm` finds our adapter shim
-     (which routes vLLM API calls to our HF-based cacheblend-hf-v4 impl).
+     (which routes vLLM API calls to our HF-based cacheblend impl).
   2. Inserts the script's own directory onto sys.path so `from utils import ...`
-     finds the symlinked utils.py (sister file from original example/).
+     finds the hard-copied utils.py.
   3. chdir into the script's directory so the relative `inputs/musique_s.json`
-     path in the original code resolves to our symlinked dataset.
-  4. runpy.run_path('blend_musique.py', run_name='__main__') — runs the
-     original file exactly as if it had been invoked directly.
+     path resolves to the hard-copied dataset.
+  4. runpy.run_path(<workload>, run_name='__main__') — runs the chosen
+     workload file exactly as if it had been invoked directly.
+
+Workload selection (CACHEBLEND_WORKLOAD):
+  blend_musique.py          (default) — YaoJiayi original, Mistral-7B, VERBATIM.
+  blend_musique_generic.py            — our model-agnostic version; runs any HF
+                                        instruction model via CACHEBLEND_MODEL.
 
 Env vars (forwarded to the shim):
   CACHEBLEND_MOCK_MODEL=1     skip model load; .generate() returns stub text.
                               Useful for CPU smoke tests without GPU/14GB VRAM.
+  CACHEBLEND_WORKLOAD         which blend_*.py to run (default blend_musique.py)
+  CACHEBLEND_MODEL            HF model id for blend_musique_generic.py
+                              (default mistralai/Mistral-7B-Instruct-v0.2)
   CACHEBLEND_DEVICE           'cuda' or 'cpu' (default: auto)
   CACHEBLEND_DTYPE            'float16' or 'float32' (default: float16)
   CACHEBLEND_CHECK_LAYER      check_layer for fuse_selective (default 1)
@@ -22,16 +30,21 @@ Env vars (forwarded to the shim):
                               musique prompts hit ~7K tokens — eager OOMs on
                               24GB GPUs)
   CACHEBLEND_MUSIQUE_N        if set, monkey-patch utils.load_dataset to slice
-                              [:N] before blend_musique.py imports it. The
-                              original file is untouched; we only intercept the
+                              [:N] before the workload imports it. The workload
+                              file is untouched; we only intercept the
                               dataset-loading helper at import time.
 
 Usage:
   # CPU dry-run of the scaffolding (no model load), 2 examples:
   CACHEBLEND_MOCK_MODEL=1 CACHEBLEND_MUSIQUE_N=2 python benchmarks/musique/run_blend_musique.py
 
-  # Real run on GPU (all 150 examples):
+  # Real run on GPU — Mistral-7B (original), all 150 examples:
   python benchmarks/musique/run_blend_musique.py
+
+  # Real run on GPU — Llama-3.1-8B (or any model) via the generic workload:
+  CACHEBLEND_WORKLOAD=blend_musique_generic.py \
+  CACHEBLEND_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+      python benchmarks/musique/run_blend_musique.py
 """
 from __future__ import annotations
 
@@ -44,21 +57,22 @@ from pathlib import Path
 def main() -> int:
     here = Path(__file__).resolve().parent
     shim_root = here / "_shim"
-    blend_script = here / "blend_musique.py"
+    workload = os.environ.get("CACHEBLEND_WORKLOAD", "blend_musique.py")
+    blend_script = here / workload
 
     if not blend_script.exists():
-        print(f"ERROR: blend_musique.py not found at {blend_script}", file=sys.stderr)
+        print(f"ERROR: workload script not found: {blend_script}", file=sys.stderr)
+        print(f"  CACHEBLEND_WORKLOAD={workload!r}; expected one of "
+              f"blend_musique.py / blend_musique_generic.py", file=sys.stderr)
         return 2
     if not shim_root.is_dir():
         print(f"ERROR: vllm shim not found at {shim_root}", file=sys.stderr)
         return 2
     if not (here / "utils.py").exists():
-        print(f"ERROR: utils.py symlink missing at {here / 'utils.py'}", file=sys.stderr)
-        print("Set up with: ln -s ../../external/CacheBlend/example/utils.py utils.py", file=sys.stderr)
+        print(f"ERROR: utils.py not found at {here / 'utils.py'}", file=sys.stderr)
         return 2
     if not (here / "inputs" / "musique_s.json").exists():
-        print(f"ERROR: dataset symlink missing at {here / 'inputs' / 'musique_s.json'}", file=sys.stderr)
-        print("Set up with: ln -s ../../../external/CacheBlend/inputs/musique_s.json inputs/musique_s.json", file=sys.stderr)
+        print(f"ERROR: dataset not found at {here / 'inputs' / 'musique_s.json'}", file=sys.stderr)
         return 2
 
     # Push shim and script dir to the front of sys.path so they outrank any
@@ -86,6 +100,7 @@ def main() -> int:
 
     print(f"[run_blend_musique] cwd: {here}", flush=True)
     print(f"[run_blend_musique] vllm shim: {shim_root}/vllm", flush=True)
+    print(f"[run_blend_musique] workload: {workload}", flush=True)
     print(f"[run_blend_musique] mock model: {os.environ.get('CACHEBLEND_MOCK_MODEL', '0')}", flush=True)
     print(f"[run_blend_musique] device: {os.environ.get('CACHEBLEND_DEVICE', 'auto')}", flush=True)
     print(f"[run_blend_musique] dtype: {os.environ.get('CACHEBLEND_DTYPE', 'float16')}", flush=True)

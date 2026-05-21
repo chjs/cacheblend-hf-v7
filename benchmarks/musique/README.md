@@ -15,17 +15,61 @@ based CacheBlend impl in `src/cacheblend/`:
 
 ```
 benchmarks/musique/
-├── blend_musique.py            # ORIGINAL, untouched (do not edit)
+├── blend_musique.py            # ORIGINAL, untouched (do not edit) — Mistral-7B
+├── blend_musique_generic.py    # OUR model-agnostic version (editable) — any model
 ├── utils.py                    # hard copy of YaoJiayi/CacheBlend/example/utils.py
 ├── inputs/musique_s.json       # hard copy of YaoJiayi/CacheBlend/inputs/musique_s.json
 ├── _shim/vllm/__init__.py      # vllm.LLM + SamplingParams adapter — routes
 │                               # generate() to LayerwiseModel + fuse_selective
-├── run_blend_musique.py        # wrapper: sets sys.path + cwd, runpy-executes blend_musique.py
+├── run_blend_musique.py        # wrapper: sets sys.path + cwd, runpy-executes the workload
 └── README.md
 ```
 
-All four hard-copied files (`blend_musique.py`, `utils.py`, `musique_s.json`,
-and the runner) are self-contained — no `external/` dependency.
+The hard-copied files (`blend_musique.py`, `utils.py`, `musique_s.json`) are
+self-contained — no `external/` dependency.
+
+### Two workloads — verbatim original + model-agnostic generic
+
+| File | Models | Status |
+|---|---|---|
+| `blend_musique.py` | Mistral-7B-Instruct-v0.2 only | **verbatim** copy of YaoJiayi original — do NOT edit |
+| `blend_musique_generic.py` | **any** HF instruction model | **our** generalization (editable) |
+
+The YaoJiayi/CacheBlend repo ships only Mistral-7B experiment scripts (it
+hard-codes Mistral's model id and `[INST]` token ids). The musique experiment
+has exactly **one** model-dependent part — the instruction wrapper:
+
+| Model | wrapper |
+|---|---|
+| Mistral | `[INST] ... [/INST]` |
+| Llama-3.1 | `<\|start_header_id\|>user<\|end_header_id\|> ... <\|eot_id\|>...assistant...` |
+| Qwen | `<\|im_start\|>user ... <\|im_end\|>...` |
+
+Everything else (dataset, prompts, `build_qa_prompt`, chunking, `compute_f1`,
+CacheBlend-vs-full comparison) is model-independent. So **there is no need for
+a new script per model.** `blend_musique_generic.py` picks the wrapper from a
+small per-family table — and for an unknown family derives it from the
+tokenizer's chat template. A new model is just `CACHEBLEND_MODEL=...`.
+
+The runner picks the workload via `CACHEBLEND_WORKLOAD`:
+
+```bash
+# Mistral, via the verbatim original (default):
+python benchmarks/musique/run_blend_musique.py
+
+# Llama-3.1-8B, via the generic workload:
+CACHEBLEND_WORKLOAD=blend_musique_generic.py \
+CACHEBLEND_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+    python benchmarks/musique/run_blend_musique.py
+
+# Qwen2.5-7B, same generic workload — no new file:
+CACHEBLEND_WORKLOAD=blend_musique_generic.py \
+CACHEBLEND_MODEL=Qwen/Qwen2.5-7B-Instruct \
+    python benchmarks/musique/run_blend_musique.py
+```
+
+Note: gated models (Llama, Mistral) require `huggingface-cli login` with a
+token that has accepted the model license.
 
 ## How it works
 
@@ -117,12 +161,14 @@ First run downloads Mistral-7B-Instruct-v0.2 (~14GB, ~8 min on HF Hub).
 | Variable | Default | Effect |
 |---|---|---|
 | `CACHEBLEND_MOCK_MODEL` | `0` | If `1`: skip model load; `generate()` returns stub text. Scaffolding-only test. |
-| `CACHEBLEND_DEVICE` | auto (`cuda` if available else `cpu`) | Device to load Mistral-7B on. |
+| `CACHEBLEND_WORKLOAD` | `blend_musique.py` | Which workload to run: `blend_musique.py` (Mistral verbatim) or `blend_musique_generic.py` (any model). |
+| `CACHEBLEND_MODEL` | `mistralai/Mistral-7B-Instruct-v0.2` | Model id used by `blend_musique_generic.py`. |
+| `CACHEBLEND_DEVICE` | auto (`cuda` if available else `cpu`) | Device to load the model on. |
 | `CACHEBLEND_DTYPE` | `float16` | Model dtype. |
 | `CACHEBLEND_CHECK_LAYER` | `1` | `check_layer` arg to `fuse_selective`. |
 | `CACHEBLEND_RECOMP_RATIO` | `0.15` | Default `recomp_ratio` (musique default). |
 | `CACHEBLEND_ATTN_IMPL` | `sdpa` | `attn_implementation` for HF model. musique prompts reach ~7K tokens; eager OOMs on 24GB GPUs. |
-| `CACHEBLEND_MUSIQUE_N` | (unset = all 150) | Slice `utils.load_dataset()[:N]`. Original file untouched; truncation done via `utils` rebinding. |
+| `CACHEBLEND_MUSIQUE_N` | (unset = all 150) | Slice `utils.load_dataset()[:N]`. Workload file untouched; truncation done via `utils` rebinding. |
 
 ## Original ↔ shim mapping
 

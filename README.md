@@ -24,7 +24,8 @@ cacheblend-hf-v7/
 │   ├── tolerance.py                        Tolerance + assert_logits_close
 │   └── __init__.py                         public API
 ├── benchmarks/musique/                   # Reproduces YaoJiayi's musique workload
-│   ├── blend_musique.py                    ORIGINAL — verbatim copy, do NOT edit
+│   ├── blend_musique.py                    ORIGINAL — verbatim copy, do NOT edit (Mistral-7B)
+│   ├── blend_musique_generic.py            our model-agnostic version — any HF model
 │   ├── utils.py                            hard copy of YaoJiayi/CacheBlend/example/utils.py
 │   ├── inputs/musique_s.json               hard copy of YaoJiayi/CacheBlend/inputs/musique_s.json
 │   ├── _shim/vllm/__init__.py              vllm.LLM adapter → routes to fuse_selective
@@ -294,10 +295,17 @@ grep -v -E '^torch(\s|=|$)' requirements.txt > /tmp/reqs-no-torch.txt
 pip install -r /tmp/reqs-no-torch.txt
 pip install -e .
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# Mistral-7B via the verbatim YaoJiayi original:
 python benchmarks/musique/run_blend_musique.py
+
+# Or any other model (Llama-3.1-8B, Qwen2.5-7B, ...) via the generic workload:
+CACHEBLEND_WORKLOAD=blend_musique_generic.py \
+CACHEBLEND_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+    python benchmarks/musique/run_blend_musique.py
 ```
 
-First run downloads Mistral-7B (~14GB), ~8 min on HF Hub.
+First run downloads the model (~14-16GB), ~8 min on HF Hub.
 
 ## What CacheBlend does
 
