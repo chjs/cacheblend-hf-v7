@@ -259,7 +259,8 @@ paper.
 
 ### 13. Tunable knobs
 
-All read from the environment by `_shim/vllm/__init__.py` at import time.
+Read from the environment — by `blend_musique_generic.py` directly, or by
+`_shim/vllm/__init__.py` for the `blend_musique.py` verbatim path.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -296,13 +297,13 @@ pip install -r /tmp/reqs-no-torch.txt
 pip install -e .
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Mistral-7B via the verbatim YaoJiayi original:
+# Mistral-7B via the verbatim YaoJiayi original (shim + runner):
 python benchmarks/musique/run_blend_musique.py
 
-# Or any other model (Llama-3.1-8B, Qwen2.5-7B, ...) via the generic workload:
-CACHEBLEND_WORKLOAD=blend_musique_generic.py \
+# Or any model (Llama-3.1-8B, Qwen2.5-7B, ...) via the shim-free generic
+# workload — standalone, no runner:
 CACHEBLEND_MODEL=meta-llama/Llama-3.1-8B-Instruct \
-    python benchmarks/musique/run_blend_musique.py
+    python benchmarks/musique/blend_musique_generic.py
 ```
 
 First run downloads the model (~14-16GB), ~8 min on HF Hub.

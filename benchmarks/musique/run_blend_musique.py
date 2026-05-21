@@ -11,10 +11,16 @@ This wrapper:
   4. runpy.run_path(<workload>, run_name='__main__') — runs the chosen
      workload file exactly as if it had been invoked directly.
 
+This runner exists for `blend_musique.py` — the YaoJiayi verbatim original,
+which can only run through the vLLM shim. The model-agnostic
+`blend_musique_generic.py` is shim-free and standalone: run it directly with
+`python benchmarks/musique/blend_musique_generic.py` (no runner needed).
+`CACHEBLEND_WORKLOAD` can still point the runner at it, but that is optional.
+
 Workload selection (CACHEBLEND_WORKLOAD):
   blend_musique.py          (default) — YaoJiayi original, Mistral-7B, VERBATIM.
-  blend_musique_generic.py            — our model-agnostic version; runs any HF
-                                        instruction model via CACHEBLEND_MODEL.
+  blend_musique_generic.py            — our model-agnostic version (also runs
+                                        standalone without this runner).
 
 Env vars (forwarded to the shim):
   CACHEBLEND_MOCK_MODEL=1     skip model load; .generate() returns stub text.

@@ -15,29 +15,36 @@ based CacheBlend impl in `src/cacheblend/`:
 
 ```
 benchmarks/musique/
-├── blend_musique.py            # ORIGINAL, untouched (do not edit) — Mistral-7B
-├── blend_musique_generic.py    # OUR model-agnostic version (editable) — any model
+├── blend_musique.py            # ORIGINAL, untouched (do not edit) — Mistral-7B, needs the shim
+├── blend_musique_generic.py    # OUR model-agnostic version (editable) — any model, shim-free
 ├── utils.py                    # hard copy of YaoJiayi/CacheBlend/example/utils.py
 ├── inputs/musique_s.json       # hard copy of YaoJiayi/CacheBlend/inputs/musique_s.json
-├── _shim/vllm/__init__.py      # vllm.LLM + SamplingParams adapter — routes
-│                               # generate() to LayerwiseModel + fuse_selective
-├── run_blend_musique.py        # wrapper: sets sys.path + cwd, runpy-executes the workload
+├── _shim/vllm/__init__.py      # vllm.LLM adapter — ONLY needed by blend_musique.py
+├── run_blend_musique.py        # wrapper for blend_musique.py (sets up shim + cwd, runpy)
 └── README.md
 ```
 
 The hard-copied files (`blend_musique.py`, `utils.py`, `musique_s.json`) are
 self-contained — no `external/` dependency.
 
-### Two workloads — verbatim original + model-agnostic generic
+### Two workloads — verbatim original (shim) + model-agnostic generic (direct)
 
-| File | Models | Status |
-|---|---|---|
-| `blend_musique.py` | Mistral-7B-Instruct-v0.2 only | **verbatim** copy of YaoJiayi original — do NOT edit |
-| `blend_musique_generic.py` | **any** HF instruction model | **our** generalization (editable) |
+| File | Models | How it runs | Status |
+|---|---|---|---|
+| `blend_musique.py` | Mistral-7B-Instruct-v0.2 only | via `run_blend_musique.py` + `_shim/vllm/` | **verbatim** YaoJiayi original — do NOT edit |
+| `blend_musique_generic.py` | **any** HF instruction model | **standalone**, calls `cacheblend` directly | **our** generalization (editable) |
 
-The YaoJiayi/CacheBlend repo ships only Mistral-7B experiment scripts (it
-hard-codes Mistral's model id and `[INST]` token ids). The musique experiment
-has exactly **one** model-dependent part — the instruction wrapper:
+`blend_musique.py` targets the YaoJiayi vLLM fork (`cache_fuse_metadata` /
+`hack_kv` hooks). To run it unmodified, `_shim/vllm/` provides a fake `vllm`
+that routes those calls to our HF code. **The shim exists only for the
+verbatim original.**
+
+`blend_musique_generic.py` does NOT use the shim. It calls
+`precompute_chunk_kv` / `fuse_selective` / `fuse_full_recompute` directly —
+no `vllm` import, no `cache_fuse_metadata`, no runner needed.
+
+The musique experiment has exactly **one** model-dependent part — the
+instruction wrapper:
 
 | Model | wrapper |
 |---|---|
@@ -51,21 +58,25 @@ a new script per model.** `blend_musique_generic.py` picks the wrapper from a
 small per-family table — and for an unknown family derives it from the
 tokenizer's chat template. A new model is just `CACHEBLEND_MODEL=...`.
 
-The runner picks the workload via `CACHEBLEND_WORKLOAD`:
+**Tokenization consistency** — `blend_musique_generic.py` tokenizes each chunk
+once and feeds the *same* `fused_input_ids(chunks)` to both `fuse_selective`
+and `fuse_full_recompute`. So at `recompute_ratio=1.0` the two paths are
+**bit-identical** (verified: 20/20 examples). The shim path, by contrast,
+re-encoded prompt strings — `encode(A)+encode(B) ≠ encode(A+B)` — so it
+diverged on a few examples even at ratio=1.0. The direct path removes that
+tokenization confound.
 
 ```bash
-# Mistral, via the verbatim original (default):
+# Mistral, verbatim original — via the shim + runner:
 python benchmarks/musique/run_blend_musique.py
 
-# Llama-3.1-8B, via the generic workload:
-CACHEBLEND_WORKLOAD=blend_musique_generic.py \
+# Llama-3.1-8B — generic workload, standalone (no shim, no runner):
 CACHEBLEND_MODEL=meta-llama/Llama-3.1-8B-Instruct \
-    python benchmarks/musique/run_blend_musique.py
+    python benchmarks/musique/blend_musique_generic.py
 
-# Qwen2.5-7B, same generic workload — no new file:
-CACHEBLEND_WORKLOAD=blend_musique_generic.py \
+# Qwen2.5-7B — same generic workload, no new file:
 CACHEBLEND_MODEL=Qwen/Qwen2.5-7B-Instruct \
-    python benchmarks/musique/run_blend_musique.py
+    python benchmarks/musique/blend_musique_generic.py
 ```
 
 Note: gated models (Llama, Mistral) require `huggingface-cli login` with a
@@ -104,71 +115,68 @@ which drops BOS for non-first chunks.
 
 ## Usage
 
-From repo root:
+From repo root.
 
-### CPU smoke test (no GPU, no model load)
-
-Verifies the entire scaffolding — sys.path injection, attribute chain access,
-collect/check/normal dispatch, output plumbing — without loading Mistral-7B:
+### Install
 
 ```bash
 pip install -e .
-pip install -r requirements.txt
-CACHEBLEND_MOCK_MODEL=1 CACHEBLEND_MUSIQUE_N=2 python benchmarks/musique/run_blend_musique.py
-```
-
-Expected (truncated):
-
-```
-[run_blend_musique] mock model: 1
-Loading dataset: inputs/musique_s.json
-[run_blend_musique] CACHEBLEND_MUSIQUE_N=2 → slicing dataset to first 2 examples
-Cached generation: [mock check 12 chunks]
-TTFT with cache: 3.83e-06
-Normal generation: [mock normal generation]
-TTFT with full prefill: 2.92e-07
-------------
-...
----------------Result Summary---------------------
-F1 with cache: 0.0
-F1 with full prefill: 0.0
-```
-
-F1 = 0 in mock mode is expected — mock generation returns stub text.
-
-### Real run on GPU
-
-Requires a GPU with ≥16GB VRAM (Mistral-7B FP16 ≈ 14GB + activations + KV).
-
-```bash
-# On pod (pytorch:2.4.1-cuda12.4 image — torch already at correct version):
-grep -v -E '^torch(\s|=|$)' requirements.txt > /tmp/reqs-no-torch.txt
-pip install -r /tmp/reqs-no-torch.txt
-pip install -e .
+pip install -r requirements.txt   # on a GPU pod with torch preinstalled, strip the torch line first
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-# Full 150-example sweep:
-python benchmarks/musique/run_blend_musique.py
-
-# Truncated to N examples:
-CACHEBLEND_MUSIQUE_N=20 python benchmarks/musique/run_blend_musique.py
 ```
 
-First run downloads Mistral-7B-Instruct-v0.2 (~14GB, ~8 min on HF Hub).
+### `blend_musique_generic.py` — recommended (shim-free, any model)
+
+Standalone — no runner, no shim:
+
+```bash
+# Mistral-7B, full 150-example sweep:
+CACHEBLEND_MODEL=mistralai/Mistral-7B-Instruct-v0.2 \
+    python benchmarks/musique/blend_musique_generic.py
+
+# Llama-3.1-8B:
+CACHEBLEND_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+    python benchmarks/musique/blend_musique_generic.py
+
+# Truncate to N examples for a quick check:
+CACHEBLEND_MUSIQUE_N=20 CACHEBLEND_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+    python benchmarks/musique/blend_musique_generic.py
+```
+
+First run downloads the model (~14-16GB, ~8 min on HF Hub). Requires a GPU
+with ≥16GB (Mistral-7B) / ≥20GB (Llama-3.1-8B) VRAM.
+
+### `blend_musique.py` — the YaoJiayi verbatim original (Mistral only, via shim)
+
+Runs the unmodified original through the vLLM shim + runner:
+
+```bash
+# CPU scaffolding smoke (no model load):
+CACHEBLEND_MOCK_MODEL=1 CACHEBLEND_MUSIQUE_N=2 python benchmarks/musique/run_blend_musique.py
+
+# Real run on GPU:
+python benchmarks/musique/run_blend_musique.py
+```
+
+`CACHEBLEND_MOCK_MODEL` and the runner exist only for this verbatim-original
+path — `blend_musique_generic.py` does not use them.
 
 ## Environment variables
 
+`blend_musique_generic.py` reads these directly:
+
 | Variable | Default | Effect |
 |---|---|---|
-| `CACHEBLEND_MOCK_MODEL` | `0` | If `1`: skip model load; `generate()` returns stub text. Scaffolding-only test. |
-| `CACHEBLEND_WORKLOAD` | `blend_musique.py` | Which workload to run: `blend_musique.py` (Mistral verbatim) or `blend_musique_generic.py` (any model). |
-| `CACHEBLEND_MODEL` | `mistralai/Mistral-7B-Instruct-v0.2` | Model id used by `blend_musique_generic.py`. |
-| `CACHEBLEND_DEVICE` | auto (`cuda` if available else `cpu`) | Device to load the model on. |
+| `CACHEBLEND_MODEL` | `mistralai/Mistral-7B-Instruct-v0.2` | HF model id. |
 | `CACHEBLEND_DTYPE` | `float16` | Model dtype. |
+| `CACHEBLEND_ATTN_IMPL` | `sdpa` | `attn_implementation`. musique prompts reach ~7K tokens; eager OOMs on 24GB GPUs. |
 | `CACHEBLEND_CHECK_LAYER` | `1` | `check_layer` arg to `fuse_selective`. |
-| `CACHEBLEND_RECOMP_RATIO` | `0.15` | Default `recomp_ratio` (musique default). |
-| `CACHEBLEND_ATTN_IMPL` | `sdpa` | `attn_implementation` for HF model. musique prompts reach ~7K tokens; eager OOMs on 24GB GPUs. |
-| `CACHEBLEND_MUSIQUE_N` | (unset = all 150) | Slice `utils.load_dataset()[:N]`. Workload file untouched; truncation done via `utils` rebinding. |
+| `CACHEBLEND_RECOMP_RATIO` | `0.15` | Recompute ratio (musique default). |
+| `CACHEBLEND_MUSIQUE_N` | (unset = all 150) | Run only the first N examples. |
+
+`blend_musique.py` (verbatim original, via the shim) additionally honours
+`CACHEBLEND_MOCK_MODEL`, `CACHEBLEND_WORKLOAD`, `CACHEBLEND_DEVICE` — these are
+shim/runner concepts and do not apply to the generic workload.
 
 ## Original ↔ shim mapping
 
