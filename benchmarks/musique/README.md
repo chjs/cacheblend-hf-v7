@@ -201,11 +201,24 @@ First run downloads Mistral-7B-Instruct-v0.2 (~14GB, ~8 min on HF Hub).
 
 See `_shim/vllm/__init__.py` for shim-internal notes.
 
-## Reproduced result (Mistral-7B-Instruct-v0.2, RTX 3090 24GB, N=150)
+## Reproduced results (N=150 each)
+
+### Mistral-7B-Instruct-v0.2 — `blend_musique.py` (verbatim original), RTX 3090 24GB
 
 | Metric | CacheBlend | Full Prefill | Delta |
 |---|---|---|---|
 | TTFT (mean) | **0.566 s** | 2.271 s | **4.01x speedup** |
 | F1 (mean) | 0.2576 | 0.2758 | -0.018 (**93.4% retention**) |
 
-Matches the YaoJiayi paper's musique claims (3-4x TTFT, 90-95% F1 retention).
+### Llama-3.1-8B-Instruct — `blend_musique_generic.py`, A100 80GB
+
+| Metric | CacheBlend | Full Prefill | Delta |
+|---|---|---|---|
+| TTFT (mean) | **0.171 s** | 0.555 s | **3.24x speedup** |
+| F1 (mean) | 0.2944 | 0.3111 | -0.017 (**94.6% retention**) |
+
+Both match the YaoJiayi paper's musique claims (3-4x TTFT, 90-95% F1
+retention). Absolute TTFT is not comparable across the two rows (different
+GPUs); the speedup ratio and F1 retention are the model-comparable signals.
+The Llama run validates that the model-agnostic `blend_musique_generic.py`
+reproduces the experiment correctly on a non-Mistral model.

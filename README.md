@@ -325,12 +325,15 @@ retention vs full prefill) on multi-doc QA.
 
 ## Reproduction status
 
-| Dataset | Model | Hardware | TTFT speedup | F1 retention | N |
-|---|---|---|---|---|---|
-| musique_s | Mistral-7B-Instruct-v0.2 | RTX 3090 24GB | 4.01x | 93.4% | 150 |
+| Dataset | Model | Workload | Hardware | TTFT speedup | F1 retention | N |
+|---|---|---|---|---|---|---|
+| musique_s | Mistral-7B-Instruct-v0.2 | `blend_musique.py` (verbatim) | RTX 3090 24GB | 4.01x | 93.4% | 150 |
+| musique_s | Llama-3.1-8B-Instruct | `blend_musique_generic.py` | A100 80GB | 3.24x | 94.6% | 150 |
 
-Matches the paper's musique claims. See `benchmarks/musique/README.md` for
-details on shim semantics, known differences, and reproduction commands.
+Both match the paper's musique claims (3-4x TTFT, 90-95% F1 retention). The
+Llama run uses the model-agnostic `blend_musique_generic.py` — same experiment,
+Llama chat headers instead of Mistral `[INST]`. See `benchmarks/musique/README.md`
+for shim semantics, known differences, and reproduction commands.
 
 ## Provenance
 
