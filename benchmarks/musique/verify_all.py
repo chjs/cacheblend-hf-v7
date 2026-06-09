@@ -31,7 +31,7 @@ from cacheblend.chunker import fused_input_ids
 from cacheblend.kv_store import KVStore
 from cacheblend.precompute import precompute_chunk_kv
 from cacheblend.fusor import fuse_selective, fuse_full_recompute, fuse_full_reuse
-from cacheblend.utils import load_dataset, build_qa_prompt, compute_f1
+from utils import load_dataset, build_qa_prompt, compute_f1
 from blend_musique_generic import (
     _resolve_wrapper, _build_chunks, _greedy_decode, PREFIX_PROMPT, QUERY_PROMPT,
 )

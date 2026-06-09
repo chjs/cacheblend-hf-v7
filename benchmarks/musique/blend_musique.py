@@ -3,7 +3,7 @@ import torch
 import json
 import numpy as np
 from transformers import AutoTokenizer
-from cacheblend.utils import load_dataset, normalize_question, build_qa_prompt, compute_f1
+from utils import load_dataset, normalize_question, build_qa_prompt, compute_f1
 from pathlib import Path
 
 eval_dataset = load_dataset("inputs/musique_s.json")
