@@ -132,7 +132,6 @@ def main() -> int:
 
     f1: dict[str, list] = {"full_prefill_all": []}
     for r in KVZIP_RATIOS:
-        f1[f"full_prefill_survivors@kv{r}"] = []
         f1[f"full_reuse_kvzip@kv{r}"] = []
         for rr in RECOMP_RATIOS:
             f1[f"compblend@kv{r}_rc{rr}"] = []
@@ -162,13 +161,6 @@ def main() -> int:
                 if doc_slice.start <= ci < doc_slice.stop:
                     cc = token_prune(cc, budget, reduce=REDUCE, protect_first=PROTECT_FIRST)
                 survivor_cmps.append(cc)
-
-            surv_chunks = [Chunk(text="", token_ids=list(cc.token_ids), chunk_id=cc.chunk_id)
-                           for cc in survivor_cmps]
-            out = fuse_full_recompute(lw, surv_chunks, return_layerwise_output=True)
-            f1[f"full_prefill_survivors@kv{r}"].append(max(compute_f1(dec(out), a, tokenizer) for a in answers))
-            del out
-            if device.type == "cuda": torch.cuda.empty_cache()
 
             blend_chunks, store = to_blend_inputs(survivor_cmps)
 
@@ -202,15 +194,24 @@ def main() -> int:
     print(f"\n{'='*70}\n== MEANS (N={len(ds)}) ==", flush=True)
     print(f"  full_prefill_all : {means['full_prefill_all']:.4f}", flush=True)
     for r in KVZIP_RATIOS:
-        ceil = means[f"full_prefill_survivors@kv{r}"]; floor = means[f"full_reuse_kvzip@kv{r}"]
-        print(f"  kv={r}: survivors_ceiling={ceil:.4f}  reuse_floor={floor:.4f}  "
-              f"[compression_gap={means['full_prefill_all']-ceil:+.4f}, blending_gap={ceil-floor:+.4f}]", flush=True)
+        floor = means[f"full_reuse_kvzip@kv{r}"]
+        print(f"  kv={r}: reuse_floor={floor:.4f}", flush=True)
         for rr in RECOMP_RATIOS:
             cb = means[f"compblend@kv{r}_rc{rr}"]
             dv, lo, hi, sig = bootci(f"compblend@kv{r}_rc{rr}", f"full_reuse_kvzip@kv{r}")
-            dc, lo2, hi2, sig2 = bootci(f"compblend@kv{r}_rc{rr}", f"full_prefill_survivors@kv{r}")
-            print(f"    compblend rc={rr}: {cb:.4f}  | vs reuse_floor {dv:+.4f} CI[{lo:+.3f},{hi:+.3f}]{'★' if sig else ''}"
-                  f"  | vs ceiling {dc:+.4f} CI[{lo2:+.3f},{hi2:+.3f}]{'★' if sig2 else ''}", flush=True)
+            print(f"    compblend rc={rr}: {cb:.4f}  | vs reuse_floor {dv:+.4f} CI[{lo:+.3f},{hi:+.3f}]{'★' if sig else ''}", flush=True)
+
+    # ── JSON dump (axes + per-question lists + means) for plotting ──
+    import json
+    out_path = os.environ.get("CB_OUT", f"/root/results_{MODEL.split('/')[-1]}.json")
+    with open(out_path, "w") as fh:
+        json.dump({
+            "model": MODEL, "N": len(ds),
+            "kvzip_ratios": KVZIP_RATIOS, "recomp_ratios": RECOMP_RATIOS,
+            "reduce": REDUCE, "protect_first": PROTECT_FIRST, "force_chunk_starts": FORCE_CHUNK_STARTS,
+            "means": means, "f1": f1,
+        }, fh)
+    print(f"WROTE {out_path}", flush=True)
     print("COMPRESS_KVZIP_DONE", flush=True)
     return 0
 
