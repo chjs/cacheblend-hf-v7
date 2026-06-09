@@ -44,28 +44,42 @@ token_prune·glue·force_chunk_starts·ranknorm_max 단위 테스트. KVzipBacke
 - **S1 sanity**: KVzip score()가 valid importance [L,H_kv,T] 생성; **sink(첫 토큰)이 실제로 높은 importance를
   받는지** 확인(사용자 가설 검증); ranknorm_max가 그 sink을 실제로 보존하는지.
 - **S2 F1 그리드 (핵심)**: kvzip_ratio × recompute_ratio. arms:
-  - `full_prefill` (천장, 압축·reuse 없음)
-  - `full_reuse` (비압축 reuse, recompute 없음 — cross-attn 손실 바닥)
-  - `full_reuse_kvzip` (압축 reuse, recompute 없음 — 압축+cross-attn손실)
-  - `compblend` (압축 + HKVD 선택재계산 — 본 제안)
+  - `full_prefill_all` (절대 천장, 압축·reuse 없음)
+  - **`full_prefill_survivors`** (★압축 후 천장 — prune된 생존자 집합을 함께 full-prefill. compblend의
+    올바른 비교 기준. 이게 있어야 압축 gap과 blending gap을 분리)
+  - `full_reuse_kvzip` (압축 생존자 reuse, recompute 없음 — blending gap 바닥)
+  - `compblend` (압축 생존자 + HKVD 선택재계산 — 본 제안)
   - force_last_chunk=True(realistic serving) 공통.
+  - gap 분해:  압축 gap = full_prefill_all − full_prefill_survivors (KVzip 책임, HKVD 무관);
+              blending gap = full_prefill_survivors − full_reuse_kvzip (HKVD가 닫아야 할 것).
 - **S3 sink 처리 ablation**: reduce∈{mean,max,ranknorm_max} × force_chunk_starts∈{0,1,4} × protect_first∈{0,1}.
 - 모델 Mistral-7B-Instruct-v0.2, 데이터 MuSiQue, token-F1.
 
-### B.3 판정 기준 (pre-register)
-- **make-or-break**: `compblend > full_reuse_kvzip` (HKVD가 압축 KV에서 F1 회복하는가). 회복 없으면 goal-1 무가치.
-- **2차**: compblend가 full_prefill의 몇 %에 도달하나 (압축률별).
-- **sink**: sink 처리 on/off가 F1을 유의하게 올리나.
+### B.3 판정 기준 (pre-register) — ★C.1 정정 반영
+HKVD는 **삭제된 KV를 회복하지 못한다**(압축 gap은 KVzip 책임). HKVD가 하는 건 **생존자들 사이의
+cross-attention 복구**(blending gap). 따라서 올바른 비교는 `full_prefill_survivors` 기준:
+- **make-or-break**: `compblend`가 **blending gap을 닫아 `full_prefill_survivors`에 근접**하는가
+  (compblend ≫ full_reuse_kvzip, 그리고 compblend → full_prefill_survivors). full_prefill_all이 아님.
+- **2차(압축 gap)**: full_prefill_survivors가 full_prefill_all의 몇 %인가 = KVzip 압축의 순손실(HKVD 무관).
+- **선택위험**: 압축 하 HKVD deviation이 [[hkvd-failure-mechanism]]처럼 부호 뒤집혀 **잘못된 토큰을 고르는지**
+  진단(random 선택 대조군 포함) — only-HKVD라 게이트 교정이 없어 이 위험 노출.
+- **sink**: sink 처리(ranknorm_max/protect/force_chunk_starts) on/off가 F1을 유의하게 올리나.
 
 ---
 
 ## Part C — 비판적 자기분석 (이 계획의 약점)
 
-### C.1 🔴 make-or-break 가설이 실패할 수 있다 ("double sparsity")
-KVzip이 70% 토큰을 **영구 삭제**한 뒤 우리는 생존자의 15%만 재계산한다. **삭제된 토큰의 cross-attention 기여는
-HKVD로 복구 불가** — HKVD는 생존자 K/V만 고치지 evicted 토큰을 부활시키지 못한다(Gemini 문서 §4.1의 정당한 우려).
-따라서 `compblend > full_reuse_kvzip`이 **성립 안 할 수도** 있고, 성립해도 압축률이 높으면 천장(full_prefill)과
-격차가 클 수 있다. **이게 goal-1 전체의 사활** — 계획은 이걸 전면에 둬야지 부차적 결과로 묻으면 안 됨.
+### C.1 🔴 두 gap을 구분하라 — HKVD는 삭제된 KV를 회복하지 못한다 (★정정)
+처음 표현("HKVD가 압축 KV를 회복")은 **부정확**했다. 정확히는 손실이 둘:
+- **압축 gap** (evict된 토큰 정보): HKVD로 **회복 불가**. KVzip 책임(생존자가 문맥 재구성한다는 전제).
+  = full_prefill_all − full_prefill_survivors.
+- **blending gap** (생존자 K/V의 cross-attention 결핍): **HKVD가 닫을 수 있는 것**. HKVD는 생존자 일부를
+  재계산해 생존자들끼리·쿼리와의 cross-attention을 복구. = full_prefill_survivors − full_reuse_kvzip.
+
+따라서 make-or-break = **compblend가 blending gap을 닫아 `full_prefill_survivors`에 근접**하는가 (full_prefill_all이
+아님). 위험: (i) "double sparsity"로 생존자만으론 cross-attention 복구가 불충분, (ii) **압축 하에서 HKVD의
+deviation 선택 자체가 망가짐**([[hkvd-failure-mechanism]]: corr −1→+0.88, 잘못된 토큰 고름) — only-HKVD라
+게이트 교정이 없어 노출. 둘 중 하나라도면 compblend가 full_reuse_kvzip을 못 이길 수 있음.
 
 ### C.2 🔴 sink 처리 정당화가 미검증 가정 위에 서 있다
 ranknorm_max "sink 보존" 테스트는 **합성 importance**(손으로 만든 픽스처)였다. **실제 KVzip importance가
