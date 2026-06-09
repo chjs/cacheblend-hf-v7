@@ -73,7 +73,7 @@ from cacheblend.chunker import Chunk, _stable_id
 from cacheblend.kv_store import KVStore
 from cacheblend.precompute import precompute_chunk_kv
 from cacheblend.fusor import fuse_selective, fuse_full_recompute
-from cacheblend.musique_utils import load_dataset, build_qa_prompt, compute_f1
+from cacheblend.utils import load_dataset, build_qa_prompt, compute_f1
 
 
 MODEL = os.environ.get("CACHEBLEND_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")

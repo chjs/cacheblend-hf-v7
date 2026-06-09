@@ -91,7 +91,7 @@ def main() -> int:
     limit = os.environ.get('CACHEBLEND_MUSIQUE_N')
     if limit:
         n = int(limit)
-        import cacheblend.musique_utils as _orig_utils
+        import cacheblend.utils as _orig_utils
         _orig_load = _orig_utils.load_dataset
 
         def _limited_load_dataset(path):

@@ -40,7 +40,7 @@ from cacheblend.chunker import Chunk, _stable_id
 from cacheblend.fusor import fuse_selective, fuse_full_recompute
 from cacheblend.compress import CompressionBudget, token_prune, to_blend_inputs
 from cacheblend.compress.kvzip import KVzipBackend, KVzipConfig
-from cacheblend.musique_utils import load_dataset, build_qa_prompt, compute_f1
+from cacheblend.utils import load_dataset, build_qa_prompt, compute_f1
 
 MODEL = os.environ["CACHEBLEND_MODEL"]
 N = int(os.environ.get("CB_N", "100"))
