@@ -18,31 +18,42 @@ Gaps:  compression gap = full_prefill_all − full_prefill_survivors (KVzip's; H
 Two models (like compblend7): KVzip ModelKVzip (flash_attn, scoring) + a separate
 sdpa LayerwiseModel (blend). Same weights; small attn-impl numeric mismatch accepted.
 
-Env: CACHEBLEND_MODEL, CB_N (examples, default 100), CB_KVZIP_RATIOS ("0.5,0.3"),
+NOTE: this file is SELF-CONTAINED (helpers inlined, benchmark utils loaded by explicit
+path) and REMOVES its own dir from sys.path, so KVzip's top-level `utils`/`model`
+packages (on PYTHONPATH) are not shadowed by benchmarks/musique/utils.py.
+
+Env: CACHEBLEND_MODEL, CB_N (default 100), CB_KVZIP_RATIOS ("0.5,0.3"),
      CB_RECOMP_RATIOS ("0.1,0.2"), CB_REDUCE (mean|max|ranknorm_max, default mean),
-     CB_PROTECT_FIRST (default 0), CB_FORCE_CHUNK_STARTS (default 0).
+     CB_PROTECT_FIRST (0), CB_FORCE_CHUNK_STARTS (0).
 """
 from __future__ import annotations
 
+import importlib.util as _ilu
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-os.chdir(HERE)
+# Drop this dir from sys.path so KVzip's top-level `utils` package (PYTHONPATH) is
+# not shadowed by benchmarks/musique/utils.py. We load utils + helpers explicitly.
+sys.path[:] = [p for p in sys.path if p and Path(p).resolve() != HERE]
+os.chdir(HERE)                                    # for inputs/musique_s.json
 os.environ.setdefault("CACHEBLEND_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
 
 from cacheblend import LayerwiseModel
-from cacheblend.chunker import Chunk
+from cacheblend.chunker import Chunk, _stable_id
 from cacheblend.fusor import fuse_selective, fuse_full_recompute
 from cacheblend.compress import CompressionBudget, token_prune, to_blend_inputs
 from cacheblend.compress.kvzip import KVzipBackend, KVzipConfig
-from utils import load_dataset, build_qa_prompt, compute_f1
-from blend_musique_generic import _resolve_wrapper, _build_chunks, _greedy_decode, PREFIX_PROMPT, QUERY_PROMPT
+
+# benchmark utils.py loaded by explicit path (NOT registered as bare `utils`).
+_uspec = _ilu.spec_from_file_location("_cbq_utils", str(HERE / "utils.py"))
+_um = _ilu.module_from_spec(_uspec); _uspec.loader.exec_module(_um)
+load_dataset, build_qa_prompt, compute_f1 = _um.load_dataset, _um.build_qa_prompt, _um.compute_f1
 
 MODEL = os.environ["CACHEBLEND_MODEL"]
 N = int(os.environ.get("CB_N", "100"))
@@ -52,6 +63,58 @@ REDUCE = os.environ.get("CB_REDUCE", "mean")
 PROTECT_FIRST = int(os.environ.get("CB_PROTECT_FIRST", "0"))
 FORCE_CHUNK_STARTS = int(os.environ.get("CB_FORCE_CHUNK_STARTS", "0"))
 CHECK_LAYER = int(os.environ.get("CACHEBLEND_CHECK_LAYER", "1"))
+MAX_NEW_TOKENS = 32
+
+# ── inlined prompt + chunk helpers (verbatim from blend_musique_generic.py) ──
+PREFIX_PROMPT = "You will be asked a question after reading several passages. Please directly answer the question based on the given passages. Do NOT repeat the question. The answer should be within 5 words..\nPassages:\n"
+QUERY_PROMPT = "\n\nAnswer the question directly based on the given passages. Do NOT repeat the question. The answer should be within 5 words. \nQuestion:"
+_WRAPPERS = {
+    "mistral": ("[INST]", "[/INST]"),
+    "llama-3": ("<|start_header_id|>user<|end_header_id|>\n\n", "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"),
+    "llama3":  ("<|start_header_id|>user<|end_header_id|>\n\n", "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"),
+    "qwen":    ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"),
+}
+
+
+def _resolve_wrapper(model_id, tokenizer):
+    mid = model_id.lower()
+    for key, wrap in _WRAPPERS.items():
+        if key in mid:
+            return wrap
+    sentinel = "\x00CONTENT\x00"
+    templated = tokenizer.apply_chat_template(
+        [{"role": "user", "content": sentinel}], tokenize=False, add_generation_prompt=True)
+    pre, post = templated.split(sentinel, 1)
+    bos = tokenizer.bos_token or ""
+    if bos and pre.startswith(bos):
+        pre = pre[len(bos):]
+    return pre, post
+
+
+def _build_chunks(tokenizer, chunk_texts):
+    bos = tokenizer.bos_token_id
+    chunks = []
+    for i, text in enumerate(chunk_texts):
+        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        if i == 0 and bos is not None:
+            ids = [bos] + ids
+        chunks.append(Chunk(text=text, token_ids=ids, chunk_id=_stable_id(text, ids)))
+    return chunks
+
+
+def _decode(model, tokenizer, logits, past_kv, device):
+    eos = getattr(tokenizer, "eos_token_id", None)
+    nxt = logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
+    gen = [int(nxt.item())]
+    with torch.inference_mode():
+        for _ in range(MAX_NEW_TOKENS - 1):
+            if eos is not None and gen[-1] == eos:
+                break
+            out = model(input_ids=nxt, past_key_values=past_kv, use_cache=True)
+            past_kv = out.past_key_values
+            nxt = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
+            gen.append(int(nxt.item()))
+    return tokenizer.decode(gen, skip_special_tokens=True)
 
 
 def main() -> int:
@@ -64,9 +127,8 @@ def main() -> int:
     user_open, assistant_open = _resolve_wrapper(MODEL, tokenizer)
     ds = load_dataset("inputs/musique_s.json")[:N]
 
-    def decode(out):
-        import time
-        return _greedy_decode(model, tokenizer, out.logits, out.past_key_values, device, time.perf_counter())[0]
+    def dec(out):
+        return _decode(model, tokenizer, out.logits, out.past_key_values, device)
 
     f1: dict[str, list] = {"full_prefill_all": []}
     for r in KVZIP_RATIOS:
@@ -79,16 +141,14 @@ def main() -> int:
         answers = ex["answers"]
         doc_prompts, q_prompt = build_qa_prompt(ex, QUERY_PROMPT)
         ctexts = [user_open + PREFIX_PROMPT] + list(doc_prompts) + [q_prompt + assistant_open]
-        orig = _build_chunks(tokenizer, ctexts)             # full token_ids (BOS on chunk0)
+        orig = _build_chunks(tokenizer, ctexts)
         doc_slice = slice(1, 1 + len(doc_prompts))
 
-        # full_prefill_all (absolute ceiling) — token_ids only, no compression.
         out = fuse_full_recompute(lw, orig, return_layerwise_output=True)
-        f1["full_prefill_all"].append(max(compute_f1(decode(out), a, tokenizer) for a in answers))
+        f1["full_prefill_all"].append(max(compute_f1(dec(out), a, tokenizer) for a in answers))
         del out
         if device.type == "cuda": torch.cuda.empty_cache()
 
-        # score every chunk ONCE (isolated, sink=0) → full CompressedChunk + importance.
         cmp_full = {}
         for c in orig:
             ids = torch.tensor([c.token_ids], dtype=torch.long, device=device)
@@ -96,7 +156,6 @@ def main() -> int:
 
         for r in KVZIP_RATIOS:
             budget = CompressionBudget(ratio=r)
-            # prune ONLY doc chunks; prefix + query stay full.
             survivor_cmps = []
             for ci, c in enumerate(orig):
                 cc = cmp_full[c.chunk_id]
@@ -104,37 +163,32 @@ def main() -> int:
                     cc = token_prune(cc, budget, reduce=REDUCE, protect_first=PROTECT_FIRST)
                 survivor_cmps.append(cc)
 
-            # full_prefill_survivors (post-compression ceiling) — joint full prefill of survivors.
             surv_chunks = [Chunk(text="", token_ids=list(cc.token_ids), chunk_id=cc.chunk_id)
                            for cc in survivor_cmps]
             out = fuse_full_recompute(lw, surv_chunks, return_layerwise_output=True)
-            f1[f"full_prefill_survivors@kv{r}"].append(max(compute_f1(decode(out), a, tokenizer) for a in answers))
+            f1[f"full_prefill_survivors@kv{r}"].append(max(compute_f1(dec(out), a, tokenizer) for a in answers))
             del out
             if device.type == "cuda": torch.cuda.empty_cache()
 
-            # blend inputs: (chunks, store) from compressed survivors (prefix/query full).
             blend_chunks, store = to_blend_inputs(survivor_cmps)
 
-            # full_reuse_kvzip — survivors reused, query fresh (rr=0 + force_last).
             out = fuse_selective(lw, blend_chunks, store, recompute_ratio=0.0, check_layer=CHECK_LAYER,
                                  return_layerwise_output=True, force_last_chunk=True,
                                  force_chunk_starts=FORCE_CHUNK_STARTS)
-            f1[f"full_reuse_kvzip@kv{r}"].append(max(compute_f1(decode(out), a, tokenizer) for a in answers))
+            f1[f"full_reuse_kvzip@kv{r}"].append(max(compute_f1(dec(out), a, tokenizer) for a in answers))
             del out
             if device.type == "cuda": torch.cuda.empty_cache()
 
-            # compblend — survivors + HKVD selective recompute, query fresh.
             for rr in RECOMP_RATIOS:
                 out = fuse_selective(lw, blend_chunks, store, recompute_ratio=rr, check_layer=CHECK_LAYER,
                                      return_layerwise_output=True, force_last_chunk=True,
                                      force_chunk_starts=FORCE_CHUNK_STARTS)
-                f1[f"compblend@kv{r}_rc{rr}"].append(max(compute_f1(decode(out), a, tokenizer) for a in answers))
+                f1[f"compblend@kv{r}_rc{rr}"].append(max(compute_f1(dec(out), a, tokenizer) for a in answers))
                 del out
                 if device.type == "cuda": torch.cuda.empty_cache()
         if (qi + 1) % 10 == 0 or qi == 0:
             print(f"  [{qi+1}/{len(ds)}] full_all={np.mean(f1['full_prefill_all']):.3f}", flush=True)
 
-    # ── aggregate + paired bootstrap CI ──
     means = {k: float(np.mean(v)) for k, v in f1.items() if v}
     rng = np.random.default_rng(0)
 
@@ -148,8 +202,7 @@ def main() -> int:
     print(f"\n{'='*70}\n== MEANS (N={len(ds)}) ==", flush=True)
     print(f"  full_prefill_all : {means['full_prefill_all']:.4f}", flush=True)
     for r in KVZIP_RATIOS:
-        ceil = means[f"full_prefill_survivors@kv{r}"]
-        floor = means[f"full_reuse_kvzip@kv{r}"]
+        ceil = means[f"full_prefill_survivors@kv{r}"]; floor = means[f"full_reuse_kvzip@kv{r}"]
         print(f"  kv={r}: survivors_ceiling={ceil:.4f}  reuse_floor={floor:.4f}  "
               f"[compression_gap={means['full_prefill_all']-ceil:+.4f}, blending_gap={ceil-floor:+.4f}]", flush=True)
         for rr in RECOMP_RATIOS:
