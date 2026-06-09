@@ -57,7 +57,11 @@
   (CacheBlendRunner는 이미 이 방식 — 동일 패턴으로 통일.)
 - **검증**: FullReuse decode가 reuse KV를 쓰는지 — 두 번째 `self.model(...)` 호출이 사라졌는지 확인.
 
-### [ ] H2. BOS / 토큰 경계 불일치 (runners 한정)
+### [x] H2. BOS / 토큰 경계 불일치 (runners 한정) — ✅ FIXED
+> **수정 완료** (compblend 브랜치): `chunk_texts(..., prepend_bos=True)` 추가(BOS를 chunk 0에만),
+> runners의 `_build_chunks`가 이를 사용, `FullRecomputeRunner`도 동일 `fused_input_ids(chunks)`를
+> 소비(전체 문자열 재토크나이즈 제거). 이제 4개 runner가 동일 토큰열 사용. tests/test_h2_tokenization.py
+> 검증 — 단일 토큰열 공유(len=61), BOS는 chunk0만, 구 경로(58)≠새 경로(61)로 구버그 입증.
 - **위치**: `runners.py:175–181`(`FullRecomputeRunner`, `add_special_tokens` 기본 True → BOS 포함)
   vs `chunker.py:48`(`chunk_texts`, `add_special_tokens=False` → BOS 없음 + 청크별 토크나이즈 후 concat).
 - **문제**: baseline과 CacheBlend가 **서로 다른 토큰 시퀀스/길이**(BOS 유무 + 경계 토큰화 차이)로

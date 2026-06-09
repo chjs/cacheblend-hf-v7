@@ -38,14 +38,22 @@ def _stable_id(text: str, token_ids: list[int]) -> str:
     return h.hexdigest()[:16]
 
 
-def chunk_texts(tokenizer, texts: list[str]) -> list[Chunk]:
+def chunk_texts(tokenizer, texts: list[str], prepend_bos: bool = False) -> list[Chunk]:
     """Tokenize each text independently and wrap as Chunks.
 
-    No special tokens added. Uses tokenizer's default config.
+    Each text is tokenized with add_special_tokens=False. With prepend_bos=True,
+    the tokenizer's BOS id is prepended to the FIRST chunk only (it sits at fused
+    position 0), so fused_input_ids(chunks) == [BOS, chunk0, chunk1, ...] — the
+    single token sequence a normal full prefill sees. Chunks 1..N carry no BOS.
+    This keeps every runner (full_recompute / reuse / prefix / selective) on an
+    identical token sequence (see docs/CODE-REVIEW-2026-06.md §H2).
     """
+    bos_id = getattr(tokenizer, "bos_token_id", None) if prepend_bos else None
     chunks: list[Chunk] = []
-    for text in texts:
+    for i, text in enumerate(texts):
         token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        if i == 0 and bos_id is not None:
+            token_ids = [bos_id] + token_ids
         chunks.append(Chunk(
             text=text,
             token_ids=token_ids,

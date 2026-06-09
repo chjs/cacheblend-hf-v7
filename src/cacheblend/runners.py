@@ -165,20 +165,29 @@ class _RunnerBase(_BaseRunner):
         for i, d in enumerate(self._docs or []):
             parts.append(f"\n\nDocument {i + 1}:\n{d}")
         parts.append(f"\n\nQuestion: {self._question}\nAnswer:")
-        return chunk_texts(self.tokenizer, parts)
+        # H2: BOS on chunk 0 only, so fused_input_ids is the single sequence every
+        # runner (incl. full_recompute) consumes — no BOS/boundary mismatch.
+        return chunk_texts(self.tokenizer, parts, prepend_bos=True)
 
 
 class FullRecomputeRunner(_RunnerBase):
     """Standard full prefill — same as harness FullPrefillRunner reference."""
 
     def _run_prefill_and_generate(self, max_new_tokens: int):
-        prompt = self._build_prompt_text()
-        enc = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        from cacheblend.chunker import fused_input_ids
+        # H2 fix: consume the SAME fused_input_ids(chunks) as the reuse/selective
+        # runners (BOS on chunk 0, per-chunk tokenization) so this baseline and
+        # CacheBlend run on an IDENTICAL token sequence. The old path tokenized
+        # the full prompt string with add_special_tokens=True, producing a
+        # different BOS + chunk-boundary tokenization than the chunked paths —
+        # an apples-to-oranges baseline (see docs/CODE-REVIEW-2026-06.md §H2).
+        chunks = self._build_chunks()
+        input_ids = fused_input_ids(chunks, device=self.device)
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         t_start = time.perf_counter()
         with torch.inference_mode():
-            out = self.model(input_ids=enc["input_ids"], use_cache=True)
+            out = self.model(input_ids=input_ids, use_cache=True)
         return self._greedy_decode_from_prefill(
             prefill_logits=out.logits,
             past_key_values=out.past_key_values,
