@@ -161,29 +161,56 @@ def _subset(chunk: CompressedChunk, keep: torch.Tensor) -> CompressedChunk:
     )
 
 
+def reduce_importance(importance: torch.Tensor, reduce: str = "mean") -> torch.Tensor:
+    """Reduce [L, H_kv, T] importance to a per-token score [T].
+
+      "mean"         = mean over all layers AND heads (compblend7 default).
+      "max"          = raw max over all layers AND heads ("critical in ANY
+                       head/layer"). KVzip-faithful, but high-magnitude heads
+                       can dominate (heads differ in attention scale).
+      "ranknorm_max" = rank-normalize per (layer,head) across tokens → [0,1],
+                       THEN max over all (layer,head). Removes head-scale bias,
+                       so a token that is TOP-RANKED in ANY single head survives
+                       — best at preserving attention-sink / spiky tokens
+                       (StreamingLLM): the sink spikes in some heads, and
+                       ranknorm_max surfaces it without dilution.
+    """
+    imp = importance.float()                                # [L, H_kv, T]
+    if reduce == "mean":
+        return imp.mean(dim=(0, 1))
+    if reduce == "max":
+        return imp.amax(dim=(0, 1))
+    if reduce == "ranknorm_max":
+        L, H, T = imp.shape
+        flat = imp.reshape(L * H, T)
+        # double-argsort = rank of each token within its (layer,head) row.
+        ranks = flat.argsort(dim=1).argsort(dim=1).to(torch.float32)
+        normed = ranks / max(1, T - 1)                      # [0, 1] per row
+        return normed.amax(dim=0)                           # max over (layer,head)
+    raise ValueError(f"reduce must be 'mean'|'max'|'ranknorm_max', got {reduce!r}")
+
+
 def token_prune(
     chunk: CompressedChunk,
     budget: CompressionBudget,
     *,
     reduce: str = "mean",
+    protect_first: int = 0,
 ) -> CompressedChunk:
     """Per-chunk budget: keep the top-k tokens of THIS chunk by importance.
 
-    reduce: how the [L, H_kv, T] importance is reduced to a per-token score.
-      "mean" (default, compblend7) = mean over all layers AND heads.
-      "max"  (KVzip-paper-faithful) = max over all layers AND heads
-             ("critical in ANY head/layer").
+    reduce: "mean" | "max" | "ranknorm_max" (see reduce_importance).
+    protect_first: always KEEP the first `protect_first` positions regardless of
+      importance (guarantees the chunk's attention-sink token survives pruning,
+      even if `reduce` would not rank it top). 0 = off. Recommended <= keep_k.
     Returns a genuinely shorter CompressedChunk (survivors only).
     """
     n = chunk.chunk_len
     k = budget.keep_k(n)
-    imp = chunk.importance.float()
-    if reduce == "max":
-        imp_tok = imp.amax(dim=(0, 1))
-    elif reduce == "mean":
-        imp_tok = imp.mean(dim=(0, 1))
-    else:
-        raise ValueError(f"reduce must be 'mean' or 'max', got {reduce!r}")
+    imp_tok = reduce_importance(chunk.importance, reduce)
+    if protect_first > 0:
+        imp_tok = imp_tok.clone()
+        imp_tok[: min(protect_first, n)] = float("inf")     # force into top-k
     keep = torch.sort(torch.topk(imp_tok, k).indices).values
     return _subset(chunk, keep)
 

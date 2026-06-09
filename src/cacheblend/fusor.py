@@ -199,6 +199,7 @@ def fuse_selective(
     return_layerwise_output: bool = False,
     return_hkvd_indices: bool = False,
     force_last_chunk: bool = False,
+    force_chunk_starts: int = 0,
 ):
     """Paper §4 selective recompute — LMCache `blender.process_qkv` 1:1 port.
 
@@ -371,6 +372,14 @@ def fuse_selective(
         # See docs/CODE-REVIEW-2026-06.md §H3.
         forced_mask = torch.zeros(total_seq, dtype=torch.bool, device=device)
         forced_mask[-1] = True
+        # force_chunk_starts: force-recompute the first N tokens of EACH chunk —
+        # the per-chunk "document-beginning" attention sinks (StreamingLLM) whose
+        # isolated-prefill K/V are stale at their blended mid-sequence position
+        # (EPIC: inappropriate; LegoLink mitigates). Recomputing them corrects the
+        # sink K/V for the blended position. See docs/CODE-REVIEW-2026-06.md §H3.
+        if force_chunk_starts > 0:
+            for (start, end) in offsets:
+                forced_mask[start:min(start + force_chunk_starts, end)] = True
         if force_last_chunk and len(chunks) > 1:
             last_start = offsets[-1][0]
             forced_mask[last_start:] = True

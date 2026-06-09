@@ -21,7 +21,7 @@ from cacheblend.kv_store import KVStore  # noqa: E402
 from cacheblend.precompute import precompute_chunk_kv  # noqa: E402
 from cacheblend.fusor import fuse_selective  # noqa: E402
 from cacheblend.compress import (  # noqa: E402
-    CompressedChunk, CompressionBudget, token_prune, to_blend_inputs,
+    CompressedChunk, CompressionBudget, token_prune, reduce_importance, to_blend_inputs,
 )
 
 
@@ -79,6 +79,62 @@ def test_token_prune_reduce_max():
     print(f"[compress] token_prune reduce=max 20→{p.chunk_len} OK")
 
 
+def test_ranknorm_max_preserves_sink_like_token():
+    """A sink-like token (top-ranked in ONE head, ~0 in others → low MEAN) is
+    DROPPED by mean's top-k but KEPT by ranknorm_max's top-k. StreamingLLM case."""
+    # [L=1, H=3, T=6]; token 0 = sink (top in head0, 0 in head1/2 → low mean).
+    imp = torch.tensor([[
+        [1.0, 0.1, 0.2, 0.3, 0.4, 0.5],   # head0: sink token0 is the max
+        [0.0, 0.9, 0.9, 0.9, 0.1, 0.1],   # head1: token0 lowest
+        [0.0, 0.9, 0.9, 0.9, 0.1, 0.1],   # head2: token0 lowest
+    ]])
+    mean_tok = reduce_importance(imp, "mean")
+    rnmax_tok = reduce_importance(imp, "ranknorm_max")
+    keep_mean = set(torch.topk(mean_tok, 3).indices.tolist())
+    keep_rn = set(torch.topk(rnmax_tok, 3).indices.tolist())
+    assert 0 not in keep_mean, f"mean unexpectedly kept the sink: {mean_tok.tolist()}"
+    assert 0 in keep_rn, f"ranknorm_max dropped the sink: {rnmax_tok.tolist()}"
+    assert abs(rnmax_tok[0].item() - 1.0) < 1e-6
+    print(f"[compress] sink: mean-top3={sorted(keep_mean)} (drops 0) | "
+          f"ranknorm_max-top3={sorted(keep_rn)} (keeps 0, score={rnmax_tok[0]:.2f}) OK")
+
+
+def test_protect_first_keeps_sink():
+    lw = _tiny_lw()
+    cc = _scored_chunk(lw, list(range(2, 14)))           # 12 tokens
+    # force importance to RANK token 0 lowest, so only protect_first saves it
+    cc.importance[:, :, 0] = -1.0
+    p = token_prune(cc, CompressionBudget(ratio=0.5), reduce="mean", protect_first=1)
+    assert cc.token_ids[0] in p.token_ids, "protect_first did not keep the sink token"
+    print(f"[compress] protect_first=1 kept token0 in {p.chunk_len} survivors OK")
+
+
+def test_force_chunk_starts():
+    lw = _tiny_lw()
+    doc0 = _scored_chunk(lw, [3, 7, 11, 5, 9, 21], seed=1)
+    doc1 = _scored_chunk(lw, [40, 2, 17, 6, 1], seed=2)
+    pruned = [token_prune(doc0, CompressionBudget(ratio=0.6)),
+              token_prune(doc1, CompressionBudget(ratio=0.6))]
+    blend_chunks, store = to_blend_inputs(pruned)
+    query = Chunk(text="", token_ids=[100, 5, 33], chunk_id=_stable_id("q", [100, 5, 33]))
+    qK, qV = precompute_chunk_kv(lw, query)
+    store.put(query.chunk_id, qK, qV)
+    chunks = blend_chunks + [query]
+
+    # chunk start offsets in the fused sequence
+    starts, pos = [], 0
+    for c in chunks:
+        starts.append(pos); pos += len(c.token_ids)
+
+    _, top = fuse_selective(lw, chunks, store, recompute_ratio=0.1, check_layer=1,
+                            return_layerwise_output=True, return_hkvd_indices=True,
+                            force_chunk_starts=1)
+    tset = set(top.tolist())
+    for s in starts:
+        assert s in tset, f"chunk start {s} not force-recomputed"
+    print(f"[compress] force_chunk_starts=1 forced starts {starts} ⊆ top OK")
+
+
 def test_compressed_blend_end_to_end():
     """Pruned compressed docs + fresh query → EXISTING fuse_selective (only-HKVD)."""
     lw = _tiny_lw()
@@ -117,5 +173,8 @@ def test_compressed_blend_end_to_end():
 if __name__ == "__main__":
     test_token_prune_shape_and_budget(); print("PASS prune shape")
     test_token_prune_reduce_max(); print("PASS prune max")
+    test_ranknorm_max_preserves_sink_like_token(); print("PASS ranknorm_max sink")
+    test_protect_first_keeps_sink(); print("PASS protect_first")
+    test_force_chunk_starts(); print("PASS force_chunk_starts")
     test_compressed_blend_end_to_end(); print("PASS e2e")
     print("\nALL COMPRESS-BLEND TESTS PASSED")

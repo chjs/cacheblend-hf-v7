@@ -11,6 +11,7 @@ from cacheblend.compress.base import (
     CompressedChunk,
     CompressionBackend,
     token_prune,
+    reduce_importance,
     to_blend_inputs,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "CompressedChunk",
     "CompressionBackend",
     "token_prune",
+    "reduce_importance",
     "to_blend_inputs",
 ]
