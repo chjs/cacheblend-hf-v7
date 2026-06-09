@@ -307,20 +307,31 @@ def fuse_selective(
             causal_mask_full = mask
 
         # ── Layers 0..check_layer-1: full fresh forward (matches LMCache) ───
-        # NOTE: HF transformers 4.49 MistralDecoderLayer uses kwarg
-        # `past_key_value` (singular). Plural silently goes into **kwargs and
-        # is ignored → cache stays empty. Same for MistralAttention.
+        # C2: the decoder-layer cache kwarg name changes across transformers
+        # versions (`past_key_value` <=4.51 vs `past_key_values` >=4.53/5.x).
+        # call_decoder_layer maps it to the supported name so the cache is never
+        # silently dropped. See docs/CODE-REVIEW-2026-06.md §C2.
+        from cacheblend.model import call_decoder_layer
         for li in range(check_layer):
-            out = inner.layers[li](
-                hidden_states=hidden_states,
+            hidden_states = call_decoder_layer(
+                inner.layers[li],
+                hidden_states,
                 attention_mask=causal_mask_full,
                 position_ids=position_ids_full,
-                past_key_value=past_key_values,
+                past_key_values=past_key_values,
                 use_cache=True,
                 cache_position=cache_position_full,
                 position_embeddings=position_embeddings_full,
             )
-            hidden_states = out if not isinstance(out, tuple) else out[0]
+
+        # C2 guard: layers 0..check_layer-1 must have populated the cache.
+        if check_layer > 0:
+            got = past_key_values.get_seq_length()
+            assert got == total_seq, (
+                f"fuse_selective: cache not populated after {check_layer} full "
+                f"layer(s) (got seq_len={got}, expected {total_seq}). Decoder-layer "
+                f"cache kwarg likely ignored — see docs/CODE-REVIEW-2026-06.md §C2."
+            )
 
         # ── Layer check_layer: manual forward with HKVD + sparse slicing ────
         layer_ck = inner.layers[check_layer]

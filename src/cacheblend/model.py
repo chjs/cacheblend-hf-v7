@@ -14,6 +14,7 @@ This module replaces the Phase 0 stub.
 """
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,6 +27,75 @@ from transformers.cache_utils import DynamicCache
 _DTYPE_MAP = {"float16": torch.float16, "fp16": torch.float16,
               "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
               "float32": torch.float32, "fp32": torch.float32}
+
+
+# ── C2 fix: version-robust decoder-layer invocation ─────────────────────────
+# transformers churns the decoder-layer cache kwarg name:
+#   <=4.51 : `past_key_value`  (singular)
+#   >=4.53 / 5.x : `past_key_values` (plural)
+# Passing the wrong name lets the cache fall into the layer's **kwargs and be
+# SILENTLY IGNORED -> DynamicCache stays empty -> decode reads no KV (no error
+# raised). See docs/CODE-REVIEW-2026-06.md §C2. We introspect each layer class's
+# forward signature once and pass only the kwargs it accepts, mapping the cache
+# to the supported name.
+_LAYER_SPEC_CACHE: dict[type, tuple] = {}
+
+
+def _layer_spec(layer) -> tuple[Optional[str], set, bool]:
+    cls = type(layer)
+    spec = _LAYER_SPEC_CACHE.get(cls)
+    if spec is None:
+        params = inspect.signature(layer.forward).parameters
+        if "past_key_values" in params:
+            cache_name: Optional[str] = "past_key_values"
+        elif "past_key_value" in params:
+            cache_name = "past_key_value"
+        else:
+            cache_name = None
+        accepted = set(params)
+        has_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        spec = (cache_name, accepted, has_var_kw)
+        _LAYER_SPEC_CACHE[cls] = spec
+    return spec
+
+
+def call_decoder_layer(
+    layer,
+    hidden_states: torch.Tensor,
+    *,
+    attention_mask,
+    position_ids,
+    past_key_values,
+    use_cache: bool,
+    cache_position,
+    position_embeddings,
+) -> torch.Tensor:
+    """Invoke an HF decoder layer robustly across transformers versions.
+
+    Maps the KV cache to whichever kwarg name the installed layer accepts
+    (`past_key_value` vs `past_key_values`) so it is never silently dropped.
+    Returns the updated hidden_states tensor.
+    """
+    cache_name, accepted, has_var_kw = _layer_spec(layer)
+
+    kwargs: dict = {"hidden_states": hidden_states}
+    candidate = {
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "use_cache": use_cache,
+        "cache_position": cache_position,
+        "position_embeddings": position_embeddings,
+    }
+    for k, v in candidate.items():
+        if k in accepted or has_var_kw:
+            kwargs[k] = v
+    if cache_name is not None:
+        kwargs[cache_name] = past_key_values
+
+    out = layer(**kwargs)
+    return out[0] if isinstance(out, tuple) else out
 
 
 @dataclass
@@ -150,16 +220,16 @@ class LayerwiseModel:
             cache_position = torch.arange(
                 past_seen, past_seen + hidden_states.shape[1], device=hidden_states.device,
             )
-        out = layer(
-            hidden_states=hidden_states,
+        return call_decoder_layer(
+            layer,
+            hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_values,
+            past_key_values=past_key_values,
             use_cache=past_key_values is not None,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
         )
-        return out[0]
 
     def final_norm_and_lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """RMSNorm + LM head → logits."""
@@ -216,6 +286,17 @@ class LayerwiseModel:
                 past_key_values=past_key_values,
                 position_embeddings=position_embeddings,
                 cache_position=cache_position,
+            )
+
+        # C2 guard: if the cache kwarg was silently dropped (version skew), the
+        # DynamicCache would be empty here and decode would read no KV. Fail loud.
+        if use_cache:
+            seq = input_ids.shape[1]
+            got = past_key_values.get_seq_length()
+            assert got == seq, (
+                f"forward_layerwise: cache not populated (got seq_len={got}, "
+                f"expected {seq}). Decoder-layer cache kwarg likely ignored — "
+                f"see docs/CODE-REVIEW-2026-06.md §C2."
             )
 
         logits = self.final_norm_and_lm_head(hidden_states)
