@@ -89,11 +89,11 @@ check("F3 H2: fused[0]==BOS", int(fused0[0, 0]) == tok.bos_token_id,
 # F2 (C2): selective populates cache full length + finite logits + coherent decode
 out_sel = fuse_selective(lw, chunks0, store0, recompute_ratio=RATIO, check_layer=1,
                          return_layerwise_output=True)
-seq_ok = out_sel.past_key_values.get_seq_length() == total0
+seq_before = out_sel.past_key_values.get_seq_length()   # capture BEFORE decode mutates it
 fin_ok = bool(torch.isfinite(out_sel.logits[0, -1]).all())
+check("F2 C2: cache full-length + finite logits", seq_before == total0 and fin_ok,
+      f"cache_seq={seq_before}/{total0} finite={fin_ok}")
 txt_sel = decode(out_sel)
-check("F2 C2: cache full-length + finite logits", seq_ok and fin_ok,
-      f"cache_seq={out_sel.past_key_values.get_seq_length()}/{total0} finite={fin_ok}")
 check("F2 C2: coherent decode", len(txt_sel.strip()) > 0, f"answer={txt_sel!r}")
 
 # F4: ratio=1.0 selective ≡ full_recompute (bit-identical logits path)
@@ -116,14 +116,15 @@ qF = sum(1 for p in range(qstart0, total0) if p in set(top_F.tolist()))
 check("F6a H3: force_last_chunk=True recomputes ALL query", qT == qlen and qT > qF,
       f"query_recomputed True={qT}/{qlen} False={qF}/{qlen}")
 
-# F5 (H1): full_reuse decodes against its OWN cache, which differs from full-recompute
+# F5 (H1): full_reuse decodes against its OWN cache, which differs from full-recompute.
+# Capture caches BEFORE any decode (greedy decode appends to past_key_values).
 out_reuse = fuse_full_reuse(lw, chunks0, store0, return_layerwise_output=True)
-txt_reuse = decode(out_reuse)
 li = lw.num_layers - 1
-k_reuse = out_reuse.past_key_values.key_cache[li]
-k_full = out_full0.past_key_values.key_cache[li]
+k_reuse = out_reuse.past_key_values.key_cache[li].clone()   # pre-decode
+k_full = out_full0.past_key_values.key_cache[li].clone()    # out_full0 was never decoded
 kdiff = (k_reuse.float() - k_full.float()).abs().max().item()
 check("F5 H1: reuse cache ≠ full-recompute cache", kdiff > 1e-3, f"last-layer max|ΔK|={kdiff:.3f}")
+txt_reuse = decode(out_reuse)
 check("F5 H1: full_reuse coherent decode", len(txt_reuse.strip()) > 0, f"answer={txt_reuse!r}")
 
 # ───────────────────────── F1 over N examples ────────────────────────────────
