@@ -32,6 +32,10 @@ import numpy as np
 import torch
 
 HERE = Path(__file__).resolve().parent
+# Drop this dir from sys.path so benchmarks/musique/utils.py does NOT shadow
+# KVzip's top-level `utils` package (on PYTHONPATH) — KVzip does `from utils.func
+# import ...`. We load our utils.py explicitly by path instead.
+sys.path[:] = [p for p in sys.path if p and Path(p).resolve() != HERE]
 os.chdir(HERE)                                    # for inputs/musique_s.json
 os.environ.setdefault("CACHEBLEND_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
 
@@ -40,7 +44,13 @@ from cacheblend.chunker import Chunk, _stable_id
 from cacheblend.fusor import fuse_selective, fuse_full_recompute
 from cacheblend.compress import CompressionBudget, token_prune, to_blend_inputs
 from cacheblend.compress.kvzip import KVzipBackend, KVzipConfig
-from utils import load_dataset, build_qa_prompt, compute_f1
+
+# benchmark utils.py loaded by explicit path (NOT as bare `utils`, to avoid the
+# KVzip name clash above).
+import importlib.util as _ilu
+_us = _ilu.spec_from_file_location("_cbq_utils", str(HERE / "utils.py"))
+_um = _ilu.module_from_spec(_us); _us.loader.exec_module(_um)
+load_dataset, build_qa_prompt, compute_f1 = _um.load_dataset, _um.build_qa_prompt, _um.compute_f1
 
 MODEL = os.environ["CACHEBLEND_MODEL"]
 N = int(os.environ.get("CB_N", "100"))
