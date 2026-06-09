@@ -378,6 +378,9 @@ def fuse_selective(
             recompute_k = n_forced + int((total_seq - n_forced) * recompute_ratio)
         else:
             recompute_k = max(int(total_seq * recompute_ratio), 1)
+        # N3: clamp both branches uniformly (defensive; n_forced>=1 already makes
+        # the force path >=1, and select_top_k_masked re-clamps to [1, total]).
+        recompute_k = max(int(recompute_k), 1)
 
         # Masked top-k: forced positions always in, rest by deviation. With
         # force_last_chunk=False this is bit-identical to the legacy

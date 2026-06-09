@@ -44,6 +44,15 @@ def precompute_chunk_kv(
         K_per_layer: list[Tensor (1, L, num_kv_heads*head_dim)] of length num_layers
         V_per_layer: list[Tensor (1, L, num_kv_heads*head_dim)] of length num_layers
     """
+    # N1 guard: a 0-token chunk would produce a (1, 0) forward (crashes inside
+    # HF attention / yields an empty cache that the C2 seq_len guard accepts as
+    # 0==0). Reject up front with a clear message.
+    if len(chunk.token_ids) == 0:
+        raise ValueError(
+            f"precompute_chunk_kv: chunk {chunk.chunk_id!r} has 0 tokens; empty "
+            f"chunks are not supported (would produce a 0-length forward)."
+        )
+
     device = layerwise_model.device
     input_ids = torch.tensor([chunk.token_ids], dtype=torch.long, device=device)
 

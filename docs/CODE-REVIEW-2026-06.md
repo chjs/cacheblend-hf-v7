@@ -8,6 +8,10 @@
 
 심각도: 🔴 Critical / 🟠 High / 🟡 Medium / 🟢 Low. 각 항목에 위치·문제·수정·검증 포함.
 
+> **수정 진행 (compblend 브랜치):** C2 ✅ / H1 ✅ / H2 ✅ / H3 ✅ (아래). 회귀 테스트 tests/
+> (4.51.3 venv): C2 3 + H1 2 + H2 3 + H3 4 + 하드닝 2 = 14 checks PASS. 어드버서리얼 재감사 결과는
+> 맨 아래 "## 어드버서리얼 재감사" 절 참조 (N1/N2/N3 수정 반영).
+
 ---
 
 ## 🔴 Critical
@@ -163,3 +167,40 @@
 H3 + P2 + P4가 결합해 **"deviation 신호의 품질"이 이미 하네스 안에서 왜곡**되어 있었고, 이는
 메모리의 realistic-serving 역전(importance가 HKVD를 못 이김 / Gated-HKVD 미재현)을 **코드 레벨에서
 일관되게 설명**한다. 수정 시 이 인과를 깨지 않도록 H3를 우선 정합할 것.
+
+---
+
+## 어드버서리얼 재감사 (2026-06-09, C2/H1/H2/H3 수정 후)
+
+수정이 의도대로인지 + 새 버그 유발 여부를 독립 리뷰어로 재검증. 신규 문제 3건 발견·수정.
+
+### [x] N1 (Medium) — 빈 청크 → 0-length forward 크래시 + C2 가드 무의미 통과 ✅ FIXED
+- token_ids=[] 청크는 `precompute_chunk_kv`에서 (1,0) forward → HF 내부 크래시. 게다가 C2 가드
+  `assert got==seq`가 seq=0이면 0==0으로 통과(무의미). 실무상 musique는 "Document N:" 래퍼로 빈
+  청크가 안 생기지만 라이브러리 레벨 결함.
+- 수정: `precompute_chunk_kv`에 0-token 청크 거부 가드(ValueError). test_hardening.py N1.
+
+### [x] N2 (Medium) — C2 수정의 잔여 위험: cache_name=None 시 cache 조용한 누락 ✅ FIXED
+- `_layer_spec`이 래핑/소거된 forward 시그니처에서 cache 파라미터를 못 찾으면 cache_name=None →
+  call_decoder_layer가 cache를 누락(=C2가 막으려던 그 실패). 현재 핀(4.51–4.52)에선 안 터지나
+  "절대 안 떨어진다"는 주장은 그 분기에서 거짓.
+- 수정: cache_name=None이고 past_key_values 있으면 즉시 RuntimeError(loud-fail). test_hardening.py N2.
+
+### [x] N3 (Low) — force 경로 recompute_k에 max(.,1) 부재 ✅ FIXED
+- `recompute_k = n_forced + int(...)`에 명시적 하한 없음(현재는 n_forced≥1 + 하류 clamp로 안전).
+  수정: 두 분기 뒤 `recompute_k = max(int(recompute_k), 1)`로 통일.
+
+### 🟢 N4 (Low, 관찰만) — 디코드 중 persistent pre-RoPE 캡처 훅 활성
+- `LayerwiseModel._install_k_proj_hooks`의 캡처 훅이 decode 스텝 동안에도 작동(`_pre_rope_k`에 기록).
+  반환 안 되므로 무해하나 낭비 + foot-gun. `__new__`로 만든 shim 모델은 `__del__` 미보장으로 훅 미제거.
+
+### 검증됨(의심스러웠으나 정확) — 독립 리뷰어가 2000회 랜덤+타이 케이스로 확인
+- select_top_k_masked는 force_last_chunk=False에서 레거시와 **bit-identical**(타이브레이크·집합크기 포함).
+- forced 위치는 +inf·target_k=max(recompute_k,n_forced)로 **항상 포함 보장**(forced가 98/100여도).
+- force_last_chunk=True가 질의 청크를 **전 layer fresh**로 처리; 큰/연속 top_indices에서도 sparse
+  forward(인덱싱·마스크·cos_sparse)가 정확. top_indices가 작다는 가정 없음.
+- ratio==0+force_last_chunk 게이팅(D-case): 질의만 fresh, 문서 전부 재사용 — 정확.
+- C2 가드는 sliding-window/GQA/batch=1에서 false-positive 없음. H2 chunk_id 안정·double-BOS 무위험
+  (Mistral/Llama/Qwen은 add_special_tokens=False면 BOS 미부착), chunk_texts 다른 호출자 무영향.
+- 에이전트 과장 정정: "check_layer==0이 fuse_selective C2 가드 우회"는 실홀 아님 — check_layer==0이면
+  call_decoder_layer 루프(range(0))가 안 돌아 누락할 cache 자체가 없음. forward_layerwise 가드는 항상 작동.

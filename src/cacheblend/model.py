@@ -80,6 +80,18 @@ def call_decoder_layer(
     """
     cache_name, accepted, has_var_kw = _layer_spec(layer)
 
+    # N2 hardening: if introspection found no cache parameter (e.g. a future
+    # transformers wraps forward with a signature-erasing decorator), we would
+    # silently drop the cache — the exact C2 failure. Fail loud instead of
+    # relying on the downstream seq_len guard. (Never triggers on the pinned
+    # 4.51–4.52 Mistral/Llama/Qwen, whose signatures are explicit.)
+    if cache_name is None and past_key_values is not None:
+        raise RuntimeError(
+            f"call_decoder_layer: {type(layer).__name__}.forward exposes no "
+            f"past_key_value(s) parameter — cannot route the KV cache "
+            f"(signature may be wrapped/erased). See docs/CODE-REVIEW-2026-06.md §C2."
+        )
+
     kwargs: dict = {"hidden_states": hidden_states}
     candidate = {
         "attention_mask": attention_mask,
