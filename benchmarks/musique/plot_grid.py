@@ -29,10 +29,10 @@ def main():
         ceil = m["full_prefill_all"]
         reuse = [m[f"full_reuse_kvzip@kv{r}"] for r in kv]
 
-        ax.axhline(ceil, ls="--", color="black", lw=1.2,
-                   label=f"full_prefill_all (ceiling) = {ceil:.3f}")
-        ax.plot(kv, reuse, ls=":", marker="s", ms=4, color="gray",
-                label="full_reuse_kvzip (rc=0, no recompute)")
+        ax.axhline(ceil, ls="--", color="black", lw=1.4,
+                   label=f"full prefill (ceiling) = {ceil:.3f}")
+        ax.plot(kv, reuse, ls=":", marker="s", ms=5, color="dimgray", lw=1.6,
+                label="full reuse (rc=0, no recompute)")
         for rr in rcs:
             ys = [m[f"compblend@kv{r}_rc{rr}"] for r in kv]
             ax.plot(kv, ys, marker="o", ms=4, lw=1.8, label=f"compblend rc={rr}")
