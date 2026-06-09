@@ -53,7 +53,7 @@ print(f"[verify_all] model={MODEL} N={N} ratio={RATIO}", flush=True)
 lw = LayerwiseModel(MODEL, dtype="float16", device="cuda", attn_implementation="sdpa")
 model, tok, device = lw.model, lw.tokenizer, lw.device
 user_open, assistant_open = _resolve_wrapper(MODEL, tok)
-ds = load_dataset()[:N]
+ds = load_dataset("inputs/musique_s.json")[:N]
 
 
 def build(ex):
