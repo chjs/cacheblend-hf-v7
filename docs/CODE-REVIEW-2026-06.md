@@ -72,7 +72,15 @@
   일치(둘 다 추가 또는 둘 다 미추가)시킬 것.
 - **검증**: 동일 예제에서 baseline/CacheBlend의 입력 토큰 길이가 일치하는지 print.
 
-### [ ] H3. 질의가 "재사용 가능한 압축 청크"로 취급됨 (realistic-serving 역전의 근원)
+### [x] H3. 질의가 "재사용 가능한 압축 청크"로 취급됨 (realistic-serving 역전의 근원) — ✅ FIXED (opt-in)
+> **수정 완료** (compblend 브랜치): `fuse_selective`에 `force_last_chunk: bool=False` 추가. True+다중청크면
+> 마지막 청크(질의) 전체를 강제 fresh, `recompute_ratio`는 문서에만 적용(질의 토큰 별도 카운트):
+> `recompute_k = n_forced + int((total−n_forced)*ratio)`. compblend7 `fuse_selective_compblend`의
+> forced/masked-topk 의미 1:1. `hkvd.select_top_k_masked` 추가, `CacheBlendRunner.force_last_chunk` +
+> benchmark `CACHEBLEND_FORCE_LAST_CHUNK` env 연결. **기본 False → 레거시 동작 bit-identical**(테스트 A로
+> 증명). 추가 교정: `ratio==0 → full_reuse` shortcut을 `not force_last_chunk`로 게이팅(질의는 ratio=0에서도
+> fresh; compblend7의 잠재 코너 수정, ratio>0 결과 불변). tests/test_h3_force_last_chunk.py 4건:
+> A(레거시 동일), B(질의 전체+문서예산 분리), C(e2e True=6/6 vs False=1/6 질의 재계산), D(ratio0 게이팅).
 - **위치**: `benchmarks/musique/blend_musique_generic.py:189–199`, `runners.py:304–307`,
   force-include 마지막 위치만 fresh `fusor.py:344–352`.
 - **문제**: 질의 청크 `[q_prompt+assistant_open]`를 precompute해 kv_store에 넣고 `fuse_selective`가

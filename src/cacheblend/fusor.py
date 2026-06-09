@@ -198,6 +198,7 @@ def fuse_selective(
     check_layer: int = 1,
     return_layerwise_output: bool = False,
     return_hkvd_indices: bool = False,
+    force_last_chunk: bool = False,
 ):
     """Paper §4 selective recompute — LMCache `blender.process_qkv` 1:1 port.
 
@@ -218,15 +219,29 @@ def fuse_selective(
     For greedy decoding to work, the last position MUST be in top_indices
     (we enforce by force-include if absent — minor LMCache deviation).
 
+    force_last_chunk (H3, realistic serving): when True and there is more than
+    one chunk, the ENTIRE last chunk (the live query suffix) is forced fresh —
+    always prefilled in full against the blended document KV, never reused — and
+    recompute_ratio then budgets ONLY the cached (document) context, with the
+    forced query tokens counted SEPARATELY:
+        recompute_k = n_forced + int((total_seq - n_forced) * recompute_ratio)
+    This matches how a real serving system treats the query (you never reuse a
+    compressed query) and is the harness fix behind the realistic-serving
+    analysis. Default False = legacy behavior (query treated as a reusable chunk;
+    only the single last position forced). See docs/CODE-REVIEW-2026-06.md §H3.
+
     Boundary safe-shortcuts [L13] (bit-exact edges):
-      - ratio == 0     → fuse_full_reuse
+      - ratio == 0     → fuse_full_reuse  (SKIPPED when force_last_chunk: the
+                         query must stay fresh, so we take the main path where
+                         only docs are reused — differs from compblend7, which
+                         never exercised ratio==0 with force_last_chunk)
       - ratio >= 1     → fuse_full_recompute
       - len(chunks) <= 1 → fuse_full_recompute
 
     See `docs/notes/lmcache-1to1-comparison.md` for the formal 1:1 mapping.
     """
     # Boundary safe-shortcuts.
-    if recompute_ratio == 0:
+    if recompute_ratio == 0 and not force_last_chunk:
         return fuse_full_reuse(layerwise_model, chunks, kv_store,
                                return_layerwise_output=return_layerwise_output)
     if recompute_ratio >= 1:
@@ -238,7 +253,7 @@ def fuse_selective(
 
     from transformers.cache_utils import DynamicCache
     from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb
-    from cacheblend.hkvd import kv_deviation, select_top_k
+    from cacheblend.hkvd import kv_deviation, select_top_k_masked
     # SDPA is memory-efficient for sparse-Q × full-K attention at long context.
     # eager_attention_forward materializes the (num_heads, topk_num, S) score
     # tensor explicitly — OOM at S>=20k. SDPA dispatches to flash / memefficient
@@ -348,19 +363,26 @@ def fuse_selective(
         # HKVD selection (pre-RoPE K is invariant; LMCache compares post-RoPE,
         # but RoPE preserves squared L2 → mathematically identical).
         deviations = kv_deviation(k_full_pre, K_stored_pre[check_layer])
-        top_indices = select_top_k(deviations, recompute_ratio)
-        # Force-include last position so greedy decode has valid logits there.
-        # (Minor deviation from LMCache; in practice last position usually
-        # ranks top by deviation, but guard for safety.)
-        last_pos = total_seq - 1
-        if last_pos not in top_indices.tolist():
-            # Drop the lowest-deviation selected to make room.
-            sel_devs = deviations[top_indices]
-            drop_idx = top_indices[sel_devs.argmin()].item()
-            top_indices = torch.tensor(
-                sorted([i for i in top_indices.tolist() if i != drop_idx] + [last_pos]),
-                dtype=top_indices.dtype, device=top_indices.device,
-            )
+
+        # Forced positions: the last position is always forced (greedy decode
+        # needs valid logits there). With force_last_chunk, the WHOLE last chunk
+        # (the live query suffix) is forced fresh and recompute_ratio budgets
+        # only the cached document context — query tokens counted separately.
+        # See docs/CODE-REVIEW-2026-06.md §H3.
+        forced_mask = torch.zeros(total_seq, dtype=torch.bool, device=device)
+        forced_mask[-1] = True
+        if force_last_chunk and len(chunks) > 1:
+            last_start = offsets[-1][0]
+            forced_mask[last_start:] = True
+            n_forced = int(forced_mask.sum().item())
+            recompute_k = n_forced + int((total_seq - n_forced) * recompute_ratio)
+        else:
+            recompute_k = max(int(total_seq * recompute_ratio), 1)
+
+        # Masked top-k: forced positions always in, rest by deviation. With
+        # force_last_chunk=False this is bit-identical to the legacy
+        # select_top_k(ratio) + force-include-last behavior.
+        top_indices = select_top_k_masked(deviations, recompute_k, forced_mask)
         topk_num = top_indices.shape[0]
 
         # Build mixed K_pre and V (cached at non-top, fresh at top).

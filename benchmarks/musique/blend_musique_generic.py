@@ -43,6 +43,9 @@ Env vars:
     CACHEBLEND_ATTN_IMPL     attn_implementation (default sdpa; eager OOMs at ~7K tokens)
     CACHEBLEND_CHECK_LAYER   check_layer for fuse_selective (default 1)
     CACHEBLEND_RECOMP_RATIO  recompute ratio (default 0.15)
+    CACHEBLEND_FORCE_LAST_CHUNK  "1" = realistic serving: query (last chunk)
+                             always prefilled fresh, ratio budgets only docs
+                             (default "0" = legacy, query is a reusable chunk)
     CACHEBLEND_MUSIQUE_N     run only the first N examples (default: all 150)
 
 Run (standalone — no runner, no shim):
@@ -78,6 +81,9 @@ DTYPE = os.environ.get("CACHEBLEND_DTYPE", "float16")
 ATTN_IMPL = os.environ.get("CACHEBLEND_ATTN_IMPL", "sdpa")
 CHECK_LAYER = int(os.environ.get("CACHEBLEND_CHECK_LAYER", "1"))
 RECOMP_RATIO = float(os.environ.get("CACHEBLEND_RECOMP_RATIO", "0.15"))
+# H3 realistic serving: force the whole last chunk (query suffix) to be prefilled
+# fresh, never reused; recompute_ratio then budgets only the document context.
+FORCE_LAST_CHUNK = os.environ.get("CACHEBLEND_FORCE_LAST_CHUNK", "0") == "1"
 MAX_NEW_TOKENS = 32
 
 # Instruction prompts — VERBATIM from blend_musique.py (experiment definition).
@@ -163,7 +169,8 @@ def _greedy_decode(model, tokenizer, prefill_logits, past_kv, device, t_prefill_
 
 def main() -> int:
     print(f"[blend_musique_generic] model={MODEL} dtype={DTYPE} attn={ATTN_IMPL} "
-          f"check_layer={CHECK_LAYER} recomp_ratio={RECOMP_RATIO}", flush=True)
+          f"check_layer={CHECK_LAYER} recomp_ratio={RECOMP_RATIO} "
+          f"force_last_chunk={FORCE_LAST_CHUNK}", flush=True)
 
     lw = LayerwiseModel(MODEL, dtype=DTYPE, attn_implementation=ATTN_IMPL)
     tokenizer, model, device = lw.tokenizer, lw.model, lw.device
@@ -206,6 +213,7 @@ def main() -> int:
             lw, chunks, kv_store,
             recompute_ratio=RECOMP_RATIO, check_layer=CHECK_LAYER,
             return_layerwise_output=True,
+            force_last_chunk=FORCE_LAST_CHUNK,
         )
         res, ttft = _greedy_decode(model, tokenizer, out.logits, out.past_key_values, device, t0)
         print(f"Cached generation: {res}")

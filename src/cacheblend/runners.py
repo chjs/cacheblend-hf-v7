@@ -297,10 +297,12 @@ class PrefixCacheRunner(_RunnerBase):
 class CacheBlendRunner(_RunnerBase):
     """Selective recompute (paper §4, sparse-forward implementation)."""
 
-    def __init__(self, model=None, tokenizer=None, recompute_ratio: float = 0.15, check_layer: int = 1):
+    def __init__(self, model=None, tokenizer=None, recompute_ratio: float = 0.15,
+                 check_layer: int = 1, force_last_chunk: bool = False):
         super().__init__(model=model, tokenizer=tokenizer)
         self.recompute_ratio = recompute_ratio
         self.check_layer = check_layer
+        self.force_last_chunk = force_last_chunk
         self._lw_model = None
         self._kv_store = None
 
@@ -330,6 +332,7 @@ class CacheBlendRunner(_RunnerBase):
             recompute_ratio=self.recompute_ratio,
             check_layer=self.check_layer,
             return_layerwise_output=True,
+            force_last_chunk=self.force_last_chunk,
         )
         return self._greedy_decode_from_prefill(
             prefill_logits=prefill_out.logits,

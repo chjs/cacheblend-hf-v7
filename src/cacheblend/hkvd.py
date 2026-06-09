@@ -75,3 +75,31 @@ def select_top_k(deviations: torch.Tensor, ratio: float) -> torch.Tensor:
     top_indices = torch.topk(deviations, k=topk_num, largest=True).indices
     top_indices, _ = torch.sort(top_indices)
     return top_indices
+
+
+def select_top_k_masked(
+    deviations: torch.Tensor,
+    recompute_k: int,
+    forced_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Top-k by deviation with `forced_mask` positions always included.
+
+    Mirrors LMCache / compblend7 masked-topk semantics: forced positions get
+    +inf (guaranteed in), then the highest-deviation remaining positions fill up
+    to ``target_k = max(recompute_k, n_forced)``. Returns indices sorted ascending
+    (causal-mask friendly).
+
+    Used by fuse_selective's force_last_chunk path. NOTE: with
+    ``forced_mask == {last position}`` and ``recompute_k = max(int(N*ratio), 1)``
+    this is identical to the plain select_top_k + force-include-last behavior —
+    so force_last_chunk=False is bit-for-bit the legacy selection.
+    """
+    n = deviations.shape[0]
+    s = deviations.detach().clone().float()
+    s[forced_mask] = float("inf")
+    n_forced = int(forced_mask.sum().item())
+    k = max(int(recompute_k), n_forced)
+    k = max(1, min(k, n))
+    idx = torch.topk(s, k=k, largest=True).indices
+    idx, _ = torch.sort(idx)
+    return idx
