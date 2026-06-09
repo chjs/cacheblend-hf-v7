@@ -74,9 +74,6 @@ def main() -> int:
     if not shim_root.is_dir():
         print(f"ERROR: vllm shim not found at {shim_root}", file=sys.stderr)
         return 2
-    if not (here / "utils.py").exists():
-        print(f"ERROR: utils.py not found at {here / 'utils.py'}", file=sys.stderr)
-        return 2
     if not (here / "inputs" / "musique_s.json").exists():
         print(f"ERROR: dataset not found at {here / 'inputs' / 'musique_s.json'}", file=sys.stderr)
         return 2
@@ -94,7 +91,7 @@ def main() -> int:
     limit = os.environ.get('CACHEBLEND_MUSIQUE_N')
     if limit:
         n = int(limit)
-        import utils as _orig_utils
+        import cacheblend.musique_utils as _orig_utils
         _orig_load = _orig_utils.load_dataset
 
         def _limited_load_dataset(path):

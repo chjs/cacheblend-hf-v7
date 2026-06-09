@@ -18,29 +18,20 @@ Gaps:  compression gap = full_prefill_all − full_prefill_survivors (KVzip's; H
 Two models (like compblend7): KVzip ModelKVzip (flash_attn, scoring) + a separate
 sdpa LayerwiseModel (blend). Same weights; small attn-impl numeric mismatch accepted.
 
-NOTE: this file is SELF-CONTAINED (helpers inlined, benchmark utils loaded by explicit
-path) and REMOVES its own dir from sys.path, so KVzip's top-level `utils`/`model`
-packages (on PYTHONPATH) are not shadowed by benchmarks/musique/utils.py.
-
 Env: CACHEBLEND_MODEL, CB_N (default 100), CB_KVZIP_RATIOS ("0.5,0.3"),
      CB_RECOMP_RATIOS ("0.1,0.2"), CB_REDUCE (mean|max|ranknorm_max, default mean),
      CB_PROTECT_FIRST (0), CB_FORCE_CHUNK_STARTS (0).
 """
 from __future__ import annotations
 
-import importlib.util as _ilu
 import os
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
 import torch
 
 HERE = Path(__file__).resolve().parent
-# Drop this dir from sys.path so KVzip's top-level `utils` package (PYTHONPATH) is
-# not shadowed by benchmarks/musique/utils.py. We load utils + helpers explicitly.
-sys.path[:] = [p for p in sys.path if p and Path(p).resolve() != HERE]
 os.chdir(HERE)                                    # for inputs/musique_s.json
 os.environ.setdefault("CACHEBLEND_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
 
@@ -49,11 +40,7 @@ from cacheblend.chunker import Chunk, _stable_id
 from cacheblend.fusor import fuse_selective, fuse_full_recompute
 from cacheblend.compress import CompressionBudget, token_prune, to_blend_inputs
 from cacheblend.compress.kvzip import KVzipBackend, KVzipConfig
-
-# benchmark utils.py loaded by explicit path (NOT registered as bare `utils`).
-_uspec = _ilu.spec_from_file_location("_cbq_utils", str(HERE / "utils.py"))
-_um = _ilu.module_from_spec(_uspec); _uspec.loader.exec_module(_um)
-load_dataset, build_qa_prompt, compute_f1 = _um.load_dataset, _um.build_qa_prompt, _um.compute_f1
+from cacheblend.musique_utils import load_dataset, build_qa_prompt, compute_f1
 
 MODEL = os.environ["CACHEBLEND_MODEL"]
 N = int(os.environ.get("CB_N", "100"))
