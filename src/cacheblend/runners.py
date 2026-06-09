@@ -228,15 +228,16 @@ class FullReuseRunner(_RunnerBase):
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         t_start = time.perf_counter()
-        prefill_logits = fuse_full_reuse(self._lw_model, chunks, self._kv_store)
-        # KV cache wasn't saved through DynamicCache here; for generation, fall
-        # back to a full forward to materialize past_key_values.
-        from cacheblend.chunker import fused_input_ids
-        input_ids = fused_input_ids(chunks, device=self.device)
-        with torch.inference_mode():
-            out = self.model(input_ids=input_ids, use_cache=True)
+        # H1 fix: decode against fuse_full_reuse's OWN cache (reused KV at every
+        # position). forward_layerwise already builds a usable DynamicCache; the
+        # k_proj/v_proj hooks make it hold the reused (RoPE-shifted) K/V. The old
+        # code ran a second hook-less full forward and decoded against that =
+        # full-RECOMPUTE KV, contaminating this "full reuse" baseline (and 2x cost).
+        out = fuse_full_reuse(
+            self._lw_model, chunks, self._kv_store, return_layerwise_output=True,
+        )
         return self._greedy_decode_from_prefill(
-            prefill_logits=prefill_logits,
+            prefill_logits=out.logits,
             past_key_values=out.past_key_values,
             max_new_tokens=max_new_tokens,
             t_start=t_start,
@@ -257,7 +258,6 @@ class PrefixCacheRunner(_RunnerBase):
     def _run_prefill_and_generate(self, max_new_tokens: int):
         from cacheblend.precompute import precompute_chunk_kv
         from cacheblend.fusor import fuse_prefix_cache
-        from cacheblend.chunker import fused_input_ids
 
         self._ensure_lw_and_store()
         chunks = self._build_chunks()
@@ -270,12 +270,15 @@ class PrefixCacheRunner(_RunnerBase):
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         t_start = time.perf_counter()
-        prefill_logits = fuse_prefix_cache(self._lw_model, chunks, self._kv_store)
-        input_ids = fused_input_ids(chunks, device=self.device)
-        with torch.inference_mode():
-            out = self.model(input_ids=input_ids, use_cache=True)
+        # H1 fix (same as FullReuseRunner): decode against fuse_prefix_cache's OWN
+        # cache — first chunk = reused KV, rest = fresh KV (true prefix-caching).
+        # The old code ran a second hook-less full forward and decoded against
+        # full-recompute KV, contaminating the prefix-cache baseline (and 2x cost).
+        out = fuse_prefix_cache(
+            self._lw_model, chunks, self._kv_store, return_layerwise_output=True,
+        )
         return self._greedy_decode_from_prefill(
-            prefill_logits=prefill_logits,
+            prefill_logits=out.logits,
             past_key_values=out.past_key_values,
             max_new_tokens=max_new_tokens,
             t_start=t_start,

@@ -43,7 +43,11 @@
 
 ## 🟠 High
 
-### [ ] H1. FullReuse 베이스라인의 prefill과 decode가 다른 KV를 씀 (실험 오염)
+### [x] H1. FullReuse 베이스라인의 prefill과 decode가 다른 KV를 씀 (실험 오염) — ✅ FIXED
+> **수정 완료** (compblend 브랜치): `FullReuseRunner`·`PrefixCacheRunner`가 두 번째 hook-less
+> full forward를 버리고 `fuse_full_reuse`/`fuse_prefix_cache`의 자체 캐시(`return_layerwise_output=True`)로
+> decode. tests/test_h1_reuse_cache.py로 검증 — 재사용 캐시 적재 확인 + 재사용 캐시 ≠ full-recompute
+> 캐시(마지막 layer K 최대차 0.70)로 구버그 입증. transformers 4.51.3에서 C2+H1 전부 PASS.
 - **위치**: `runners.py:231–243`.
 - **문제**: `fuse_full_reuse`로 prefill logits를 얻은 뒤, decode용 `past_key_values`를 얻으려고
   **훅 없는 plain full forward를 한 번 더** 실행 → decode 캐시가 full-recompute KV가 됨. FullReuse가
