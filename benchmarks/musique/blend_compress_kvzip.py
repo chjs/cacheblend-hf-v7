@@ -200,7 +200,7 @@ def main() -> int:
 
     # ── JSON dump (axes + per-question lists + means) for plotting ──
     import json
-    out_path = os.environ.get("CB_OUT", f"/root/results_{MODEL.split('/')[-1]}.json")
+    out_path = os.environ.get("CB_OUT", f"/tmp/results_{MODEL.split('/')[-1]}.json")
     with open(out_path, "w") as fh:
         json.dump({
             "model": MODEL, "N": len(ds),
