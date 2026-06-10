@@ -13,13 +13,11 @@
 
 # --- Core (locked exactly) ---
 torch==2.4.1
-# transformers: run env uses 4.51.3 (KVzip imports qwen3, added in 4.51.0).
-# Lower bound 4.51.0 (qwen3); upper bound <4.53 because this code uses the
-# internal `_update_causal_mask` API, removed in 4.53+ (see CODE-REVIEW C2/API
-# drift). The decoder-layer cache-kwarg rename is handled at runtime by
-# cacheblend.model.call_decoder_layer, so both 4.51 (singular) and 5.x (plural)
-# call correctly — but full 5.x support also needs the mask-API migration.
-transformers>=4.51.0,<4.53
+# transformers: PIN EXACTLY 4.51.3 — the only version validated end-to-end.
+# (qwen3 needs >=4.51.0; >=4.52 changes post_init/tensor-parallel handling and
+#  >=4.53 removes the internal _update_causal_mask API this code uses. A loose
+#  range let pip pick 4.52.x, which breaks Llama load with ALL_PARALLEL_STYLES.)
+transformers==4.51.3
 accelerate==1.13.0
 huggingface-hub==0.36.2
 tokenizers==0.21.4
