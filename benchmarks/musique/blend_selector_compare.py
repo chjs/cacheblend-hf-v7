@@ -276,8 +276,21 @@ def main() -> int:
                     if k_pos > 0:
                         fx[torch.topk(ps_masked, k_pos).indices] = True
                     budgets_ph = [int(n_forced + k_pos + round(k_rem * dd)) for dd in decay]
-                    arm_cfg[f"pos_hybrid{int(round(s_frac * 100))}"] = dict(
+                    tag = int(round(s_frac * 100))
+                    # position-first + HKVD-who/importance-depth (needs runtime deviation)
+                    arm_cfg[f"pos_hybrid{tag}"] = dict(
                         forced_extra_mask=fx, layer_scores=Fmass, layer_budgets=budgets_ph)
+                    # position-first + FLAT importance for the remainder — FULLY
+                    # OFFLINE selection (zero selection overhead at blend time)
+                    rr_imp = min(1.0, k_rem / max(1, n_doc - k_pos))
+                    arm_cfg[f"pos_imp{tag}"] = dict(
+                        forced_extra_mask=fx, selection_scores=imp_scores,
+                        recompute_ratio=rr_imp)
+                    # position-first + importance future-mass SCHEDULING for the
+                    # remainder — also fully offline (no deviation anywhere)
+                    arm_cfg[f"pos_gradimp{tag}"] = dict(
+                        forced_extra_mask=fx, selection_scores=Fmass[CHECK_LAYER],
+                        layer_scores=Fmass, layer_budgets=budgets_ph)
                 sels = {}
                 for arm in ARMS:
                     kw = dict(arm_cfg[arm])
@@ -325,7 +338,14 @@ def main() -> int:
             contrasts = [(a, "hkvd") for a in ARMS if a != "hkvd" and "hkvd" in ARMS]
             for ref in ("position", "grad_hybrid"):
                 if ref in ARMS:
-                    contrasts += [(a, ref) for a in ARMS if a.startswith("pos_hybrid")]
+                    contrasts += [(a, ref) for a in ARMS if a.startswith("pos_")]
+            # cheapest (offline) vs best: pos_imp*/pos_gradimp* vs same-split pos_hybrid
+            for a in ARMS:
+                for p in ("pos_imp", "pos_gradimp"):
+                    if a.startswith(p):
+                        twin = f"pos_hybrid{a[len(p):]}"
+                        if twin in ARMS:
+                            contrasts.append((a, twin))
             seen = set()
             for a_key, b_key in contrasts:
                 if (a_key, b_key) in seen or a_key not in ARMS or b_key not in ARMS:
