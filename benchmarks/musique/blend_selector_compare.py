@@ -80,7 +80,8 @@ CHECK_LAYER = int(os.environ.get("CACHEBLEND_CHECK_LAYER", "1"))
 GATE_PCT = float(os.environ.get("CB_GATE_PCT", "0.7"))     # gated: keep top 70% by imp
 SCHED_START = float(os.environ.get("CB_SCHED_START", "1.5"))  # grad: stage-0 = 1.5×k → 0.5×k
 MAX_NEW_TOKENS = 32
-ARMS = ("hkvd", "imp", "random", "position", "gated", "grad_imp", "grad_hybrid")
+ARMS = tuple(a.strip() for a in os.environ.get(
+    "CB_ARMS", "hkvd,imp,random,position,gated,grad_imp,grad_hybrid").split(",") if a.strip())
 
 PREFIX_PROMPT = "You will be asked a question after reading several passages. Please directly answer the question based on the given passages. Do NOT repeat the question. The answer should be within 5 words..\nPassages:\n"
 QUERY_PROMPT = "\n\nAnswer the question directly based on the given passages. Do NOT repeat the question. The answer should be within 5 words. \nQuestion:"
@@ -274,9 +275,12 @@ def main() -> int:
                     sels[arm] = sel_doc
                     del out
                     torch.cuda.empty_cache()
-                ji = (len(sels["hkvd"] & sels["imp"]) / max(1, len(sels["hkvd"] | sels["imp"])))
-                diag[f"jaccard@kv{r}_rc{rr}"].append(ji)
+                if "hkvd" in sels and "imp" in sels:
+                    ji = (len(sels["hkvd"] & sels["imp"]) / max(1, len(sels["hkvd"] | sels["imp"])))
+                    diag[f"jaccard@kv{r}_rc{rr}"].append(ji)
                 for a in ("hkvd", "imp", "position"):
+                    if a not in sels:
+                        continue
                     sel = sels[a]
                     frac = (sum(1 for p in sel if int(offset_in_chunk[p]) < 4) / max(1, len(sel)))
                     diag[f"startfrac_{a}@kv{r}_rc{rr}"].append(frac)
@@ -308,12 +312,19 @@ def main() -> int:
                 ("random", "hkvd", "rnd−hkvd"),
                 ("position", "imp", "pos−imp"),
             ):
+                if a_key not in ARMS or b_key not in ARMS:
+                    continue
                 d_, lo, hi, sig = bootci(f"{a_key}@kv{r}_rc{rr}", f"{b_key}@kv{r}_rc{rr}")
                 print(f"      {label:18s}: {d_:+.4f} CI[{lo:+.3f},{hi:+.3f}]{'★' if sig else ''}", flush=True)
-            print(f"      diag: jaccard(hkvd,imp)={dmeans[f'jaccard@kv{r}_rc{rr}']:.3f}  "
-                  f"start<4: hkvd={dmeans[f'startfrac_hkvd@kv{r}_rc{rr}']:.3f} "
-                  f"imp={dmeans[f'startfrac_imp@kv{r}_rc{rr}']:.3f} "
-                  f"pos={dmeans[f'startfrac_position@kv{r}_rc{rr}']:.3f}", flush=True)
+            dparts = []
+            if f"jaccard@kv{r}_rc{rr}" in dmeans:
+                dparts.append(f"jaccard(hkvd,imp)={dmeans[f'jaccard@kv{r}_rc{rr}']:.3f}")
+            for a in ("hkvd", "imp", "position"):
+                key = f"startfrac_{a}@kv{r}_rc{rr}"
+                if key in dmeans:
+                    dparts.append(f"start<4[{a}]={dmeans[key]:.3f}")
+            if dparts:
+                print("      diag: " + "  ".join(dparts), flush=True)
 
     out_path = os.environ.get("CB_OUT", f"/tmp/selcmp_{MODEL.split('/')[-1]}.json")
     with open(out_path, "w") as fh:
