@@ -13,6 +13,15 @@ signal for recompute selection differs:
   random    fixed-seed random scores — signal floor (proves selectors carry info)
   position  earlier-in-chunk-first — pure chunk-start/sink heuristic; measures
             how much of imp's value is just "recompute the doc-beginning sinks"
+  gated     Gated HKVD (the paper's selector): importance gates the candidate
+            set to the top CB_GATE_PCT (default 0.7) of doc positions, HKVD
+            picks within the gate. Budget equalized to the other arms.
+  grad_imp  gradual filtering (paper §4.3) driven by OFFLINE per-layer
+            importance: stage-0 set chosen by future-importance-mass, then
+            narrowed each layer by that layer's remaining future mass. Equal
+            token-layer FLOPs vs flat arms (Σ budgets = flat_k × n_stages).
+  grad_hybrid  "HKVD decides WHO, importance decides HOW DEEP": stage-0 set by
+            HKVD deviation (oversampled), narrowing by per-layer future mass.
 
 Fairness guards (the realistic-serving-reversal lessons):
   * force_last_chunk=True everywhere — query always fresh; budget counts docs only
@@ -68,8 +77,10 @@ SEL_REDUCE = os.environ.get("CB_SEL_REDUCE", "mean")      # importance [L,H,T]�
 CHUNK_NORM = os.environ.get("CB_CHUNK_NORM", "rank")      # cross-chunk comparability
 PRUNE_REDUCE = "mean"                                      # FIXED for all arms
 CHECK_LAYER = int(os.environ.get("CACHEBLEND_CHECK_LAYER", "1"))
+GATE_PCT = float(os.environ.get("CB_GATE_PCT", "0.7"))     # gated: keep top 70% by imp
+SCHED_START = float(os.environ.get("CB_SCHED_START", "1.5"))  # grad: stage-0 = 1.5×k → 0.5×k
 MAX_NEW_TOKENS = 32
-ARMS = ("hkvd", "imp", "random", "position")
+ARMS = ("hkvd", "imp", "random", "position", "gated", "grad_imp", "grad_hybrid")
 
 PREFIX_PROMPT = "You will be asked a question after reading several passages. Please directly answer the question based on the given passages. Do NOT repeat the question. The answer should be within 5 words..\nPassages:\n"
 QUERY_PROMPT = "\n\nAnswer the question directly based on the given passages. Do NOT repeat the question. The answer should be within 5 words. \nQuestion:"
@@ -129,7 +140,7 @@ def _rank01(x: torch.Tensor) -> torch.Tensor:
 
 def main() -> int:
     print(f"[selector-compare] model={MODEL} N={N} kvzip={KVZIP_RATIOS} recomp={RECOMP_RATIOS} "
-          f"sel_reduce={SEL_REDUCE} chunk_norm={CHUNK_NORM} prune_reduce={PRUNE_REDUCE}", flush=True)
+          f"sel_reduce={SEL_REDUCE} chunk_norm={CHUNK_NORM} prune_reduce={PRUNE_REDUCE} gate={GATE_PCT} sched_start={SCHED_START}", flush=True)
     backend = KVzipBackend(MODEL, KVzipConfig(kv_type="retain"))
     os.environ["COMPBLEND_KVZIP_NO_SYS_PROMPT"] = "1"      # isolated per-chunk scoring (sink included)
     lw = LayerwiseModel(MODEL, dtype="float16", device="cuda", attn_implementation="sdpa")
@@ -197,6 +208,20 @@ def main() -> int:
             g = torch.Generator().manual_seed(10_000 + qi)
             rand_scores = torch.rand(total, generator=g)
 
+            # Per-layer fused importance (per-layer within-chunk rank) + FUTURE
+            # MASS F[l,t] = mean importance over layers >= l — "how much will this
+            # token's fresh KV matter from layer l onward" (offline clairvoyance).
+            n_layers = lw.num_layers
+            imp_layers = torch.zeros(n_layers, total)
+            for ci in range(len(blend_chunks)):
+                if doc_slice.start <= ci < doc_slice.stop:
+                    s, T = starts[ci], lens[ci]
+                    M = survivor_cmps[ci].importance.float().mean(dim=1).cpu()   # [L,T]
+                    Mr = M.argsort(dim=-1).argsort(dim=-1).float() / max(1, T - 1)
+                    imp_layers[:, s:s + T] = Mr
+            Fmass = torch.flip(torch.cumsum(torch.flip(imp_layers, [0]), 0), [0])
+            Fmass = Fmass / torch.arange(n_layers, 0, -1, dtype=torch.float32).view(-1, 1)
+
             # reuse floor (rc=0 + forced query)
             out = fuse_selective(lw, blend_chunks, store, recompute_ratio=0.0,
                                  check_layer=CHECK_LAYER, return_layerwise_output=True,
@@ -206,14 +231,43 @@ def main() -> int:
             torch.cuda.empty_cache()
 
             for rr in RECOMP_RATIOS:
+                # equal-budget bookkeeping
+                n_doc = int(doc_mask.sum())
+                k_target = int(n_doc * rr)                 # flat non-forced budget
+                n_forced = lens[-1]                        # query chunk (forced fresh)
+                n_stages = n_layers - CHECK_LAYER
+                # grad: linear decay SCHED_START×k → (2−SCHED_START)×k, mean = k
+                # → Σ budgets == flat (n_forced + k) × n_stages (equal FLOPs)
+                decay = np.linspace(SCHED_START, 2.0 - SCHED_START, n_stages)
+                budgets = [int(n_forced + round(k_target * d)) for d in decay]
+                # gated: top GATE_PCT of doc positions by importance; HKVD inside;
+                # ratio adjusted so selected count == k_target (equal budget)
+                doc_idx = torch.nonzero(doc_mask).flatten()
+                k_gate = max(1, int(n_doc * GATE_PCT))
+                gate_keep = doc_idx[torch.topk(imp_scores[doc_idx], k_gate).indices]
+                gated_mask = torch.zeros(total, dtype=torch.bool)
+                gated_mask[gate_keep] = True
+                rr_gated = min(1.0, k_target / max(1, k_gate))
+
+                arm_cfg = {
+                    "hkvd":        dict(),
+                    "imp":         dict(selection_scores=imp_scores),
+                    "random":      dict(selection_scores=rand_scores),
+                    "position":    dict(selection_scores=pos_scores),
+                    "gated":       dict(eligible_mask=gated_mask, recompute_ratio=rr_gated),
+                    "grad_imp":    dict(selection_scores=Fmass[CHECK_LAYER],
+                                        layer_scores=Fmass, layer_budgets=budgets),
+                    "grad_hybrid": dict(layer_scores=Fmass, layer_budgets=budgets),
+                }
                 sels = {}
-                for arm, sc in (("hkvd", None), ("imp", imp_scores),
-                                ("random", rand_scores), ("position", pos_scores)):
+                for arm in ARMS:
+                    kw = dict(arm_cfg[arm])
+                    kw.setdefault("eligible_mask", doc_mask)
+                    kw.setdefault("recompute_ratio", rr)
                     out, top = fuse_selective(
-                        lw, blend_chunks, store, recompute_ratio=rr,
+                        lw, blend_chunks, store,
                         check_layer=CHECK_LAYER, return_layerwise_output=True,
-                        return_hkvd_indices=True, force_last_chunk=True,
-                        selection_scores=sc, eligible_mask=doc_mask)
+                        return_hkvd_indices=True, force_last_chunk=True, **kw)
                     f1[f"{arm}@kv{r}_rc{rr}"].append(
                         max(compute_f1(dec(out), a, tokenizer) for a in answers))
                     sel_doc = {int(p) for p in top.tolist() if bool(doc_mask[int(p)])}
@@ -246,11 +300,16 @@ def main() -> int:
         for rr in RECOMP_RATIOS:
             vals = "  ".join(f"{a}={means[f'{a}@kv{r}_rc{rr}']:.4f}" for a in ARMS)
             print(f"    rc={rr}: {vals}", flush=True)
-            di, lo, hi, sig = bootci(f"imp@kv{r}_rc{rr}", f"hkvd@kv{r}_rc{rr}")
-            dr, lo2, hi2, sig2 = bootci(f"random@kv{r}_rc{rr}", f"hkvd@kv{r}_rc{rr}")
-            dp, lo3, hi3, sig3 = bootci(f"position@kv{r}_rc{rr}", f"imp@kv{r}_rc{rr}")
-            print(f"      ★PRIMARY imp−hkvd: {di:+.4f} CI[{lo:+.3f},{hi:+.3f}]{'★' if sig else ''}"
-                  f"   rnd−hkvd: {dr:+.4f}{'★' if sig2 else ''}   pos−imp: {dp:+.4f}{'★' if sig3 else ''}", flush=True)
+            for a_key, b_key, label in (
+                ("imp", "hkvd", "imp−hkvd"),
+                ("gated", "hkvd", "gated−hkvd"),
+                ("grad_imp", "hkvd", "grad_imp−hkvd"),
+                ("grad_hybrid", "hkvd", "grad_hybrid−hkvd"),
+                ("random", "hkvd", "rnd−hkvd"),
+                ("position", "imp", "pos−imp"),
+            ):
+                d_, lo, hi, sig = bootci(f"{a_key}@kv{r}_rc{rr}", f"{b_key}@kv{r}_rc{rr}")
+                print(f"      {label:18s}: {d_:+.4f} CI[{lo:+.3f},{hi:+.3f}]{'★' if sig else ''}", flush=True)
             print(f"      diag: jaccard(hkvd,imp)={dmeans[f'jaccard@kv{r}_rc{rr}']:.3f}  "
                   f"start<4: hkvd={dmeans[f'startfrac_hkvd@kv{r}_rc{rr}']:.3f} "
                   f"imp={dmeans[f'startfrac_imp@kv{r}_rc{rr}']:.3f} "
