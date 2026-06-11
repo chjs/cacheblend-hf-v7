@@ -204,6 +204,7 @@ def fuse_selective(
     eligible_mask: torch.Tensor | None = None,
     layer_scores: torch.Tensor | None = None,
     layer_budgets: list | None = None,
+    forced_extra_mask: torch.Tensor | None = None,
 ):
     """Paper §4 selective recompute — LMCache `blender.process_qkv` 1:1 port.
 
@@ -429,6 +430,17 @@ def fuse_selective(
         if force_chunk_starts > 0:
             for (start, end) in offsets:
                 forced_mask[start:min(start + force_chunk_starts, end)] = True
+        # forced_extra_mask: caller-chosen positions forced fresh IN ADDITION to
+        # the standard forced set (e.g. position-first budgeting: chunk prefixes
+        # get guaranteed recompute and survive every schedule stage; the
+        # remaining budget goes to the ranked/scheduled selection).
+        if forced_extra_mask is not None:
+            fx = forced_extra_mask.reshape(-1).to(device=device, dtype=torch.bool)
+            if int(fx.numel()) != total_seq:
+                raise ValueError(
+                    f"forced_extra_mask length {int(fx.numel())} != total_seq {total_seq}"
+                )
+            forced_mask |= fx
         if force_last_chunk and len(chunks) > 1:
             last_start = offsets[-1][0]
             forced_mask[last_start:] = True

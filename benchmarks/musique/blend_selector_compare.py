@@ -79,6 +79,10 @@ PRUNE_REDUCE = "mean"                                      # FIXED for all arms
 CHECK_LAYER = int(os.environ.get("CACHEBLEND_CHECK_LAYER", "1"))
 GATE_PCT = float(os.environ.get("CB_GATE_PCT", "0.7"))     # gated: keep top 70% by imp
 SCHED_START = float(os.environ.get("CB_SCHED_START", "1.5"))  # grad: stage-0 = 1.5×k → 0.5×k
+# pos_hybrid<S>: position-FIRST budgeting — S% of the budget goes to chunk
+# prefixes (forced, survive all layers), the remainder runs grad_hybrid
+# (HKVD-who × importance-depth) at equal total FLOPs.
+POS_SPLITS = [float(x) for x in os.environ.get("CB_POS_SPLITS", "0.25,0.5,0.75").split(",") if x]
 MAX_NEW_TOKENS = 32
 ARMS = tuple(a.strip() for a in os.environ.get(
     "CB_ARMS", "hkvd,imp,random,position,gated,grad_imp,grad_hybrid").split(",") if a.strip())
@@ -260,6 +264,20 @@ def main() -> int:
                                         layer_scores=Fmass, layer_budgets=budgets),
                     "grad_hybrid": dict(layer_scores=Fmass, layer_budgets=budgets),
                 }
+                # pos_hybrid<S>: k_pos = S×k forced at chunk prefixes (round-robin
+                # by offset, all-layer survival); remaining k−k_pos scheduled by
+                # grad_hybrid. Σ budgets == flat (n_forced + k) × n_stages.
+                ps_masked = pos_scores.clone()
+                ps_masked[~doc_mask] = float("-inf")
+                for s_frac in POS_SPLITS:
+                    k_pos = int(round(k_target * s_frac))
+                    k_rem = k_target - k_pos
+                    fx = torch.zeros(total, dtype=torch.bool)
+                    if k_pos > 0:
+                        fx[torch.topk(ps_masked, k_pos).indices] = True
+                    budgets_ph = [int(n_forced + k_pos + round(k_rem * dd)) for dd in decay]
+                    arm_cfg[f"pos_hybrid{int(round(s_frac * 100))}"] = dict(
+                        forced_extra_mask=fx, layer_scores=Fmass, layer_budgets=budgets_ph)
                 sels = {}
                 for arm in ARMS:
                     kw = dict(arm_cfg[arm])
@@ -304,18 +322,17 @@ def main() -> int:
         for rr in RECOMP_RATIOS:
             vals = "  ".join(f"{a}={means[f'{a}@kv{r}_rc{rr}']:.4f}" for a in ARMS)
             print(f"    rc={rr}: {vals}", flush=True)
-            for a_key, b_key, label in (
-                ("imp", "hkvd", "imp−hkvd"),
-                ("gated", "hkvd", "gated−hkvd"),
-                ("grad_imp", "hkvd", "grad_imp−hkvd"),
-                ("grad_hybrid", "hkvd", "grad_hybrid−hkvd"),
-                ("random", "hkvd", "rnd−hkvd"),
-                ("position", "imp", "pos−imp"),
-            ):
-                if a_key not in ARMS or b_key not in ARMS:
+            contrasts = [(a, "hkvd") for a in ARMS if a != "hkvd" and "hkvd" in ARMS]
+            for ref in ("position", "grad_hybrid"):
+                if ref in ARMS:
+                    contrasts += [(a, ref) for a in ARMS if a.startswith("pos_hybrid")]
+            seen = set()
+            for a_key, b_key in contrasts:
+                if (a_key, b_key) in seen or a_key not in ARMS or b_key not in ARMS:
                     continue
+                seen.add((a_key, b_key))
                 d_, lo, hi, sig = bootci(f"{a_key}@kv{r}_rc{rr}", f"{b_key}@kv{r}_rc{rr}")
-                print(f"      {label:18s}: {d_:+.4f} CI[{lo:+.3f},{hi:+.3f}]{'★' if sig else ''}", flush=True)
+                print(f"      {a_key+'−'+b_key:26s}: {d_:+.4f} CI[{lo:+.3f},{hi:+.3f}]{'★' if sig else ''}", flush=True)
             dparts = []
             if f"jaccard@kv{r}_rc{rr}" in dmeans:
                 dparts.append(f"jaccard(hkvd,imp)={dmeans[f'jaccard@kv{r}_rc{rr}']:.3f}")
