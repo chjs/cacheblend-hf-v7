@@ -280,12 +280,16 @@ def main() -> int:
                     # position-first + HKVD-who/importance-depth (needs runtime deviation)
                     arm_cfg[f"pos_hybrid{tag}"] = dict(
                         forced_extra_mask=fx, layer_scores=Fmass, layer_budgets=budgets_ph)
+                    rr_rem = min(1.0, k_rem / max(1, n_doc - k_pos))
                     # position-first + FLAT importance for the remainder — FULLY
                     # OFFLINE selection (zero selection overhead at blend time)
-                    rr_imp = min(1.0, k_rem / max(1, n_doc - k_pos))
                     arm_cfg[f"pos_imp{tag}"] = dict(
                         forced_extra_mask=fx, selection_scores=imp_scores,
-                        recompute_ratio=rr_imp)
+                        recompute_ratio=rr_rem)
+                    # position-first + FLAT HKVD for the remainder — NO importance
+                    # anywhere (isolates the scheduling contribution of pos_hybrid)
+                    arm_cfg[f"pos_hkvd{tag}"] = dict(
+                        forced_extra_mask=fx, recompute_ratio=rr_rem)
                     # position-first + importance future-mass SCHEDULING for the
                     # remainder — also fully offline (no deviation anywhere)
                     arm_cfg[f"pos_gradimp{tag}"] = dict(
@@ -341,7 +345,7 @@ def main() -> int:
                     contrasts += [(a, ref) for a in ARMS if a.startswith("pos_")]
             # cheapest (offline) vs best: pos_imp*/pos_gradimp* vs same-split pos_hybrid
             for a in ARMS:
-                for p in ("pos_imp", "pos_gradimp"):
+                for p in ("pos_imp", "pos_gradimp", "pos_hkvd"):
                     if a.startswith(p):
                         twin = f"pos_hybrid{a[len(p):]}"
                         if twin in ARMS:
