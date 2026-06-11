@@ -200,8 +200,22 @@ def fuse_selective(
     return_hkvd_indices: bool = False,
     force_last_chunk: bool = False,
     force_chunk_starts: int = 0,
+    selection_scores: torch.Tensor | None = None,
+    eligible_mask: torch.Tensor | None = None,
 ):
     """Paper §4 selective recompute — LMCache `blender.process_qkv` 1:1 port.
+
+    selection_scores (selector override): optional float tensor [total_seq]. When
+    given, recompute-token ranking uses THESE scores instead of HKVD deviation —
+    same masked-top-k machinery, different signal (enables importance / random /
+    position selectors for controlled comparisons). None = HKVD (default).
+
+    eligible_mask: optional bool tensor [total_seq]. False positions are never
+    selected (scores forced to -inf) unless covered by the forced mask. Use to
+    restrict the candidate pool (e.g. doc chunks only — an exact-prefix-match
+    chunk is not stale, so spending recompute there is waste). When given, the
+    recompute budget is computed over the ELIGIBLE pool, so different selectors
+    compare at equal budget over the same pool. None = all positions (default).
 
     Algorithm:
       Layers 0..check_layer-1: full fresh forward (matches LMCache).
@@ -361,9 +375,31 @@ def fuse_selective(
         k_full_pre = attn_ck.k_proj(h_normed)     # (1, S, hidden_kv) PRE-RoPE
         v_full = attn_ck.v_proj(h_normed)         # (1, S, hidden_kv)
 
-        # HKVD selection (pre-RoPE K is invariant; LMCache compares post-RoPE,
-        # but RoPE preserves squared L2 → mathematically identical).
-        deviations = kv_deviation(k_full_pre, K_stored_pre[check_layer])
+        # Ranking signal: HKVD deviation (default) or caller-provided
+        # selection_scores — same masked-top-k machinery, different signal.
+        if selection_scores is None:
+            # HKVD (pre-RoPE K is invariant; LMCache compares post-RoPE, but
+            # RoPE preserves squared L2 → mathematically identical).
+            scores = kv_deviation(k_full_pre, K_stored_pre[check_layer])
+        else:
+            if int(selection_scores.numel()) != total_seq:
+                raise ValueError(
+                    f"selection_scores length {int(selection_scores.numel())} "
+                    f"!= total_seq {total_seq}"
+                )
+            scores = selection_scores.reshape(-1).to(device=device, dtype=torch.float32)
+
+        # eligible_mask: restrict the candidate pool. Ineligible positions can
+        # never be selected (-inf) unless forced (forced wins via +inf later).
+        elig = None
+        if eligible_mask is not None:
+            elig = eligible_mask.reshape(-1).to(device=device, dtype=torch.bool)
+            if int(elig.numel()) != total_seq:
+                raise ValueError(
+                    f"eligible_mask length {int(elig.numel())} != total_seq {total_seq}"
+                )
+            scores = scores.clone()
+            scores[~elig] = float("-inf")
 
         # Forced positions: the last position is always forced (greedy decode
         # needs valid logits there). With force_last_chunk, the WHOLE last chunk
@@ -384,17 +420,29 @@ def fuse_selective(
             last_start = offsets[-1][0]
             forced_mask[last_start:] = True
             n_forced = int(forced_mask.sum().item())
-            recompute_k = n_forced + int((total_seq - n_forced) * recompute_ratio)
+            # Budget base = candidate pool (eligible & non-forced when an
+            # eligible_mask is given) — equal budget over the same pool across
+            # selectors.
+            if elig is not None:
+                base = int((elig & ~forced_mask).sum().item())
+            else:
+                base = total_seq - n_forced
+            recompute_k = n_forced + int(base * recompute_ratio)
         else:
-            recompute_k = max(int(total_seq * recompute_ratio), 1)
+            base = int(elig.sum().item()) if elig is not None else total_seq
+            recompute_k = max(int(base * recompute_ratio), 1)
         # N3: clamp both branches uniformly (defensive; n_forced>=1 already makes
         # the force path >=1, and select_top_k_masked re-clamps to [1, total]).
         recompute_k = max(int(recompute_k), 1)
+        # Never exceed forced + eligible pool (avoid selecting -inf positions).
+        if elig is not None:
+            pool = int(forced_mask.sum().item()) + int((elig & ~forced_mask).sum().item())
+            recompute_k = min(recompute_k, pool)
 
-        # Masked top-k: forced positions always in, rest by deviation. With
-        # force_last_chunk=False this is bit-identical to the legacy
-        # select_top_k(ratio) + force-include-last behavior.
-        top_indices = select_top_k_masked(deviations, recompute_k, forced_mask)
+        # Masked top-k: forced positions always in, rest by the ranking signal.
+        # With selection_scores=None / eligible_mask=None / force_last_chunk=False
+        # this is bit-identical to the legacy select_top_k + force-include-last.
+        top_indices = select_top_k_masked(scores, recompute_k, forced_mask)
         topk_num = top_indices.shape[0]
 
         # Build mixed K_pre and V (cached at non-top, fresh at top).
