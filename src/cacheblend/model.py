@@ -144,12 +144,31 @@ class LayerwiseModel:
         # 24-48GB GPUs. fuse_selective manually calls SDPA for sparse layers
         # (check_layer+), so the configured impl only affects the full-forward
         # layers (0..check_layer-1) — flash/eager mix is safe.
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch_dtype,
-            attn_implementation=attn_implementation,
-            low_cpu_mem_usage=True,
-        ).to(self.device).eval()
+        # CACHEBLEND_4BIT=1: NF4 4-bit quantized load (bitsandbytes) — for models
+        # too large to hold twice in fp16 (e.g. Llama-70B: 2×~38GB fits one H200).
+        # Compute dtype = torch_dtype, so downstream fusor tensors stay fp16.
+        # NOTE: a bnb-quantized model must not be .to(device)-moved.
+        import os as _os
+        if _os.environ.get("CACHEBLEND_4BIT", "0") == "1":
+            from transformers import BitsAndBytesConfig
+            bnb = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch_dtype,
+            )
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=bnb,
+                device_map={"": 0},
+                attn_implementation=attn_implementation,
+                low_cpu_mem_usage=True,
+            ).eval()
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_implementation,
+                low_cpu_mem_usage=True,
+            ).to(self.device).eval()
 
         # Direct refs to internal modules to avoid repeated attribute lookup.
         self._inner = self.model.model        # MistralModel / LlamaModel
