@@ -42,7 +42,7 @@ os.environ.setdefault("CACHEBLEND_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
 from cacheblend import LayerwiseModel
 from cacheblend.chunker import Chunk, _stable_id
 from cacheblend.fusor import fuse_selective, fuse_full_recompute
-from cacheblend.compress import CompressionBudget, token_prune, to_blend_inputs
+from cacheblend.compress import CompressionBudget, token_prune, to_blend_inputs, reduce_importance
 from cacheblend.compress.kvzip import KVzipBackend, KVzipConfig
 
 # benchmark utils.py loaded by explicit path (NOT as bare `utils`, to avoid the
@@ -153,17 +153,39 @@ def main() -> int:
         for r in KVZIP_RATIOS:
             budget = CompressionBudget(ratio=r)
             survivor_cmps = []
+            # full_input_ids + retained_pos: New KV is computed over the FULL
+            # pre-eviction text (CacheBlend first-layer prefill). retained_pos =
+            # positions of retained tokens within the full fused sequence, in the
+            # SAME order as blend_chunks. Evicted tokens stay only as context.
+            full_ids_list: list[int] = []
+            retained_pos_list: list[int] = []
+            full_off = 0
             for ci, c in enumerate(orig):
                 cc = cmp_full[c.chunk_id]
+                n_ci = cc.chunk_len
                 if doc_slice.start <= ci < doc_slice.stop:
+                    k = budget.keep_k(n_ci)
+                    imp_tok = reduce_importance(cc.importance, REDUCE)
+                    if PROTECT_FIRST > 0:
+                        imp_tok = imp_tok.clone()
+                        imp_tok[: min(PROTECT_FIRST, n_ci)] = float("inf")
+                    keep = torch.sort(torch.topk(imp_tok, k).indices).values
                     cc = token_prune(cc, budget, reduce=REDUCE, protect_first=PROTECT_FIRST)
+                else:
+                    keep = torch.arange(n_ci)
                 survivor_cmps.append(cc)
+                full_ids_list.extend(int(t) for t in orig[ci].token_ids)
+                retained_pos_list.extend(full_off + int(i) for i in keep.tolist())
+                full_off += n_ci
 
             blend_chunks, store = to_blend_inputs(survivor_cmps)
+            full_input_ids = torch.tensor(full_ids_list, dtype=torch.long, device=device)
+            retained_pos = torch.tensor(retained_pos_list, dtype=torch.long, device=device)
 
             out = fuse_selective(lw, blend_chunks, store, recompute_ratio=0.0, check_layer=CHECK_LAYER,
                                  return_layerwise_output=True, force_last_chunk=True,
-                                 force_chunk_starts=FORCE_CHUNK_STARTS)
+                                 force_chunk_starts=FORCE_CHUNK_STARTS,
+                                 full_input_ids=full_input_ids, retained_pos=retained_pos)
             f1[f"full_reuse_kvzip@kv{r}"].append(max(compute_f1(dec(out), a, tokenizer) for a in answers))
             del out
             if device.type == "cuda": torch.cuda.empty_cache()
@@ -171,7 +193,8 @@ def main() -> int:
             for rr in RECOMP_RATIOS:
                 out = fuse_selective(lw, blend_chunks, store, recompute_ratio=rr, check_layer=CHECK_LAYER,
                                      return_layerwise_output=True, force_last_chunk=True,
-                                     force_chunk_starts=FORCE_CHUNK_STARTS)
+                                     force_chunk_starts=FORCE_CHUNK_STARTS,
+                                     full_input_ids=full_input_ids, retained_pos=retained_pos)
                 f1[f"compblend@kv{r}_rc{rr}"].append(max(compute_f1(dec(out), a, tokenizer) for a in answers))
                 del out
                 if device.type == "cuda": torch.cuda.empty_cache()

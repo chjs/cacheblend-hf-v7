@@ -200,8 +200,25 @@ def fuse_selective(
     return_hkvd_indices: bool = False,
     force_last_chunk: bool = False,
     force_chunk_starts: int = 0,
+    full_input_ids=None,
+    retained_pos=None,
 ):
     """Paper §4 selective recompute — LMCache `blender.process_qkv` 1:1 port.
+
+    full_input_ids / retained_pos (compressed-KV blending): when the cached chunks
+    are COMPRESSED (KVzip eviction), `chunks` hold only the RETAINED tokens, so a
+    retained token's New KV would otherwise be computed over the evicted/retained-
+    only sequence — its evicted neighbors absent — contaminating the HKVD
+    deviation. CacheBlend computes New KV by a first-layer prefill over the FULL
+    input; to honor that, pass `full_input_ids` (the full pre-eviction fused token
+    ids, 1-D or [1,N]) and `retained_pos` (the indices, into that full sequence, of
+    the retained tokens — in the SAME left-to-right order as `chunks`). Layers
+    0..check_layer-1 are then re-run over the full sequence (evicted tokens present
+    only as transient context) and the retained positions are gathered to seed the
+    check-layer input. Evicted tokens are NEVER added to the KV pool/output cache —
+    everything from check_layer on stays on the retained pool exactly as before.
+    Exact for the default check_layer=1 (layer-0 K/V are context-free). Both None
+    (default) → legacy uncompressed path, bit-identical.
 
     Algorithm:
       Layers 0..check_layer-1: full fresh forward (matches LMCache).
@@ -348,6 +365,46 @@ def fuse_selective(
                 f"layer(s) (got seq_len={got}, expected {total_seq}). Decoder-layer "
                 f"cache kwarg likely ignored — see docs/CODE-REVIEW-2026-06.md §C2."
             )
+
+        # ── Compressed-KV fix: New KV over the FULL pre-eviction text ───────
+        # Re-run layers 0..check_layer-1 over the full input (evicted tokens
+        # present as context) and gather the retained positions, so the check-
+        # layer input hidden state — and thus the New KV / HKVD deviation — is
+        # computed with each retained token's real neighbors. Evicted tokens are
+        # NOT added to the pool here; they only provide transient context. The
+        # output cache for layers 0..check_layer-1 stays as computed above
+        # (retained-only, packed) — exact for check_layer=1 (context-free K/V).
+        if full_input_ids is not None:
+            full_ids = full_input_ids.to(device=device, dtype=torch.long).reshape(1, -1)
+            n_full = full_ids.shape[1]
+            rp = retained_pos.to(device=device, dtype=torch.long).reshape(-1)
+            with torch.inference_mode():
+                h_full = inner.embed_tokens(full_ids)
+                pos_full2 = torch.arange(n_full, device=device).unsqueeze(0)
+                cos2, sin2 = inner.rotary_emb(h_full, pos_full2)
+                cache_pos2 = torch.arange(n_full, device=device)
+                throwaway = DynamicCache()
+                mask2 = inner._update_causal_mask(
+                    attention_mask=None, input_tensor=h_full,
+                    cache_position=cache_pos2, past_key_values=throwaway,
+                    output_attentions=False,
+                )
+                if mask2 is None:
+                    mask2 = torch.zeros((1, 1, n_full, n_full), dtype=dtype, device=device)
+                    mask2.masked_fill_(
+                        torch.triu(torch.ones(n_full, n_full, dtype=torch.bool, device=device), diagonal=1),
+                        float("-inf"),
+                    )
+                for li in range(check_layer):
+                    h_full = call_decoder_layer(
+                        inner.layers[li], h_full,
+                        attention_mask=mask2, position_ids=pos_full2,
+                        past_key_values=throwaway, use_cache=True,
+                        cache_position=cache_pos2, position_embeddings=(cos2, sin2),
+                    )
+            # Gather retained positions → full-context check-layer input. Order
+            # of retained_pos must match the retained `chunks` left-to-right.
+            hidden_states = h_full[:, rp, :].contiguous()
 
         # ── Layer check_layer: manual forward with HKVD + sparse slicing ────
         layer_ck = inner.layers[check_layer]
