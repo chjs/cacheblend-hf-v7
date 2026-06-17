@@ -203,6 +203,9 @@ def fuse_selective(
     full_input_ids=None,
     retained_pos=None,
     gate_mask=None,
+    selection_scores=None,
+    layer_scores=None,
+    layer_budgets=None,
 ):
     """Paper §4 selective recompute — LMCache `blender.process_qkv` 1:1 port.
 
@@ -419,9 +422,16 @@ def fuse_selective(
         k_full_pre = attn_ck.k_proj(h_normed)     # (1, S, hidden_kv) PRE-RoPE
         v_full = attn_ck.v_proj(h_normed)         # (1, S, hidden_kv)
 
-        # HKVD selection (pre-RoPE K is invariant; LMCache compares post-RoPE,
-        # but RoPE preserves squared L2 → mathematically identical).
-        deviations = kv_deviation(k_full_pre, K_stored_pre[check_layer])
+        # Ranking signal: HKVD deviation (default) or caller-provided
+        # selection_scores (e.g. importance) — same masked-top-k machinery.
+        # pre-RoPE K is invariant; LMCache compares post-RoPE, but RoPE preserves
+        # squared L2 → mathematically identical.
+        if selection_scores is None:
+            deviations = kv_deviation(k_full_pre, K_stored_pre[check_layer])
+        else:
+            if int(selection_scores.numel()) != total_seq:
+                raise ValueError(f"selection_scores length {int(selection_scores.numel())} != total_seq {total_seq}")
+            deviations = selection_scores.reshape(-1).to(device=device, dtype=torch.float32).clone()
 
         # Forced positions: the last position is always forced (greedy decode
         # needs valid logits there). With force_last_chunk, the WHOLE last chunk
@@ -465,11 +475,44 @@ def fuse_selective(
             n_cand = int((gm & (~forced_mask)).sum().item())
             recompute_k = max(min(recompute_k, n_f + n_cand), 1)
 
+        # Static gradual filtering (layer scheduling): layer_budgets[0] overrides
+        # the stage-0 set size; layer_scores ([n_layers, total_seq]) decides which
+        # tokens survive into each deeper layer (nested shrink). Driven by OFFLINE
+        # per-layer scores (e.g. importance depth) instead of runtime deviation —
+        # the static analogue of CacheBlend §4.3 gradual filtering. None = flat.
+        if layer_budgets is not None:
+            if layer_scores is None:
+                raise ValueError("layer_budgets requires layer_scores")
+            if len(layer_budgets) != n_layers - check_layer:
+                raise ValueError(f"layer_budgets needs {n_layers - check_layer} entries, got {len(layer_budgets)}")
+            recompute_k = max(int(layer_budgets[0]), 1)
+
         # Masked top-k: forced positions always in, rest by deviation. With
         # force_last_chunk=False this is bit-identical to the legacy
         # select_top_k(ratio) + force-include-last behavior.
         top_indices = select_top_k_masked(deviations, recompute_k, forced_mask)
         topk_num = top_indices.shape[0]
+
+        # Nested per-layer sets (gradual filtering). schedule[j] = indices still
+        # recomputed at layer check_layer+j; sets only shrink; forced always
+        # survive; dropped tokens keep cached KV from their drop layer onward.
+        schedule = None
+        if layer_budgets is not None:
+            ls_all = layer_scores.to(device=device, dtype=torch.float32)
+            if tuple(ls_all.shape) != (n_layers, total_seq):
+                raise ValueError(f"layer_scores must be [{n_layers}, {total_seq}], got {tuple(ls_all.shape)}")
+            schedule = [top_indices]
+            prev = top_indices
+            for j in range(1, n_layers - check_layer):
+                b = min(max(int(layer_budgets[j]), 1), int(prev.numel()))
+                b = max(b, int(forced_mask[prev].sum().item()))
+                if b >= int(prev.numel()):
+                    schedule.append(prev); continue
+                sc_prev = ls_all[check_layer + j][prev].clone()
+                sc_prev[forced_mask[prev]] = float("inf")
+                keep = torch.topk(sc_prev, b).indices
+                prev = prev[keep.sort().values]
+                schedule.append(prev)
 
         # Build mixed K_pre and V (cached at non-top, fresh at top).
         k_mixed_pre = k_full_pre.clone()
@@ -525,29 +568,44 @@ def fuse_selective(
         h_sparse = residual_sparse2 + h_sparse
 
         # ── Layers check_layer+1..end: sparse hidden, full mixed K/V cache ─
-        cos_sparse = cos_full[:, top_indices, :]
-        sin_sparse = sin_full[:, top_indices, :]
+        cur = top_indices                     # per-layer recompute set (may shrink)
+        cur_k = topk_num
+        cos_sparse = cos_full[:, cur, :]
+        sin_sparse = sin_full[:, cur, :]
 
-        # cache_position for sparse: original positions of top_indices.
+        # cache_position for sparse: original positions of cur.
         # (Matches what LMCache stores — sparse Q's "true" positions.)
 
         for li in range(check_layer + 1, n_layers):
+            # Gradual filtering: shrink to this layer's scheduled set BEFORE the
+            # projections. Dropped tokens stop propagating; their KV at this and
+            # deeper layers stays cached (nested-set semantics).
+            if schedule is not None:
+                nxt = schedule[li - check_layer]
+                if int(nxt.numel()) < cur_k:
+                    rows = torch.searchsorted(cur, nxt)     # nxt ⊆ cur, both ascending
+                    h_sparse = h_sparse[:, rows, :]
+                    cur = nxt
+                    cur_k = int(nxt.numel())
+                    cos_sparse = cos_full[:, cur, :]
+                    sin_sparse = sin_full[:, cur, :]
+
             layer_li = inner.layers[li]
             attn_li = layer_li.self_attn
 
             residual_sparse_in = h_sparse
             h_normed_sparse = layer_li.input_layernorm(h_sparse)
 
-            q_sparse = attn_li.q_proj(h_normed_sparse)       # (1, topk_num, num_heads*hd)
-            k_sparse_pre = attn_li.k_proj(h_normed_sparse)   # (1, topk_num, hidden_kv) PRE-RoPE
-            v_sparse = attn_li.v_proj(h_normed_sparse)       # (1, topk_num, hidden_kv)
+            q_sparse = attn_li.q_proj(h_normed_sparse)       # (1, cur_k, num_heads*hd)
+            k_sparse_pre = attn_li.k_proj(h_normed_sparse)   # (1, cur_k, hidden_kv) PRE-RoPE
+            v_sparse = attn_li.v_proj(h_normed_sparse)       # (1, cur_k, hidden_kv)
 
-            sparse_shape = (1, topk_num, -1, head_dim)
+            sparse_shape = (1, cur_k, -1, head_dim)
             q_sparse_heads = q_sparse.view(sparse_shape).transpose(1, 2)
             k_sparse_heads_pre = k_sparse_pre.view(sparse_shape).transpose(1, 2)
             v_sparse_heads = v_sparse.view(sparse_shape).transpose(1, 2)
 
-            # RoPE on sparse Q, K at the actual (top_indices) positions.
+            # RoPE on sparse Q, K at the actual (cur) positions.
             q_sparse_post, k_sparse_post = apply_rotary_pos_emb(
                 q_sparse_heads, k_sparse_heads_pre, cos_sparse, sin_sparse
             )
@@ -565,21 +623,21 @@ def fuse_selective(
                 dummy_q, k_cached_pre_heads, cos_full, sin_full
             )
 
-            # Scatter fresh at top.
+            # Scatter fresh at cur.
             k_full_li = k_cached_post_heads.clone()
-            k_full_li[:, :, top_indices, :] = k_sparse_post
+            k_full_li[:, :, cur, :] = k_sparse_post
 
             # V: cached at non-top, fresh at top (V has no RoPE).
             v_cached_heads = V_stored[li].view(
                 1, total_seq, num_kv_heads, head_dim
             ).transpose(1, 2)
             v_full_li = v_cached_heads.clone()
-            v_full_li[:, :, top_indices, :] = v_sparse_heads
+            v_full_li[:, :, cur, :] = v_sparse_heads
 
             past_key_values.update(k_full_li, v_full_li, li)
 
             # SDPA: sparse Q × full mixed K/V attention.
-            sparse_causal_mask_li = causal_mask_full[:, :, top_indices, :total_seq]
+            sparse_causal_mask_li = causal_mask_full[:, :, cur, :total_seq]
             k_rep_li = k_full_li.repeat_interleave(n_rep, dim=1)
             v_rep_li = v_full_li.repeat_interleave(n_rep, dim=1)
             attn_out_li = _sdpa(
@@ -588,7 +646,7 @@ def fuse_selective(
                 scale=attn_li.scaling,
             )
             attn_out_li = attn_out_li.transpose(1, 2).reshape(
-                1, topk_num, num_heads * head_dim,
+                1, cur_k, num_heads * head_dim,
             ).contiguous()
             attn_out_li = attn_li.o_proj(attn_out_li)
 
@@ -607,7 +665,7 @@ def fuse_selective(
         # non-top positions get zeros (no fresh computation occurred there).
         vocab_size = logits_sparse.shape[-1]
         logits_full = torch.zeros((1, total_seq, vocab_size), dtype=logits_sparse.dtype, device=device)
-        logits_full[:, top_indices, :] = logits_sparse
+        logits_full[:, cur, :] = logits_sparse
 
     out_obj = LayerwiseOutput(logits=logits_full, past_key_values=past_key_values)
     result = out_obj if return_layerwise_output else logits_full
