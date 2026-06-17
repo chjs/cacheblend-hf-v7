@@ -202,6 +202,7 @@ def fuse_selective(
     force_chunk_starts: int = 0,
     full_input_ids=None,
     retained_pos=None,
+    gate_mask=None,
 ):
     """Paper §4 selective recompute — LMCache `blender.process_qkv` 1:1 port.
 
@@ -447,6 +448,22 @@ def fuse_selective(
         # N3: clamp both branches uniformly (defensive; n_forced>=1 already makes
         # the force path >=1, and select_top_k_masked re-clamps to [1, total]).
         recompute_k = max(int(recompute_k), 1)
+
+        # Gated HKVD (paper §3 Stage-1): importance gates the candidate set
+        # C = { i | Importance(i) >= tau }; HKVD (Stage-2) then selects within C.
+        # gate_mask (bool [total_seq], True = in C) is precomputed by the caller
+        # from compression-derived importance. Non-candidate, non-forced positions
+        # get -inf deviation so HKVD never picks them; forced (query) bypass the
+        # gate. None => no gate (only-HKVD), bit-identical to before.
+        if gate_mask is not None:
+            gm = gate_mask.reshape(-1).to(device=device, dtype=torch.bool)
+            if int(gm.numel()) != total_seq:
+                raise ValueError(f"gate_mask length {int(gm.numel())} != total_seq {total_seq}")
+            deviations = deviations.clone()
+            deviations[(~gm) & (~forced_mask)] = float("-inf")
+            n_f = int(forced_mask.sum().item())
+            n_cand = int((gm & (~forced_mask)).sum().item())
+            recompute_k = max(min(recompute_k, n_f + n_cand), 1)
 
         # Masked top-k: forced positions always in, rest by deviation. With
         # force_last_chunk=False this is bit-identical to the legacy
