@@ -34,8 +34,10 @@ sys.path[:] = [p for p in sys.path if p and Path(p).resolve() != HERE]
 os.chdir(HERE)
 os.environ.setdefault("CACHEBLEND_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 
-from cacheblend.compress.kvzip import KVzipBackend, KVzipConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
+# NOTE: KVzipBackend is imported LAZILY (Phase B) — instantiating it globally
+# monkey-patches Llama attention so output_attentions returns None. We capture
+# attention with a clean eager model FIRST (Phase A), then load KVzip (Phase B).
 
 import importlib.util as _ilu
 _us = _ilu.spec_from_file_location("_cbq_utils", str(HERE / "utils.py"))
@@ -71,15 +73,45 @@ def rank01(x):                        # [T] -> percentile rank in [0,1]
 
 def main() -> int:
     print(f"[sink_diag] model={MODEL} N={N} sink_k={SINK_K} reduce={REDUCE} topq={TOPQ}", flush=True)
-    backend = KVzipBackend(MODEL, KVzipConfig(kv_type="retain"))
-    os.environ["COMPBLEND_KVZIP_NO_SYS_PROMPT"] = "1"
     tok = AutoTokenizer.from_pretrained(MODEL)
+    ds = load_dataset("inputs/musique_s.json")[:N]
+
+    # build doc-chunk token id lists (deterministic) once
+    chunks_per_q = []
+    for ex in ds:
+        docs, _ = build_qa_prompt(ex, QUERY_PROMPT)
+        chunks_per_q.append([tok(d, add_special_tokens=False)["input_ids"] for d in docs])
+
+    # ── Phase A: attention-received via CLEAN eager model (before any KVzip) ──
     model = AutoModelForCausalLM.from_pretrained(
         MODEL, torch_dtype=torch.float16, attn_implementation="eager", device_map={"": 0})
     model.eval()
     device = model.device
     n_layers = model.config.num_hidden_layers
-    ds = load_dataset("inputs/musique_s.json")[:N]
+    recv_store = {}                                # (qi,ci) -> received_LT [L,T] cpu
+    for qi, chunk_ids in enumerate(chunks_per_q):
+        for ci, ids in enumerate(chunk_ids):
+            T = len(ids)
+            if T < SINK_K + 4:
+                continue
+            ids_t = torch.tensor([ids], dtype=torch.long, device=device)
+            with torch.inference_mode():
+                out = model(input_ids=ids_t, output_attentions=True, use_cache=False)
+            if out.attentions is None or out.attentions[0] is None:
+                raise RuntimeError("output_attentions returned None — eager attention not active")
+            rec = torch.stack([out.attentions[li][0].float().sum(1).mean(0).cpu() for li in range(n_layers)])
+            recv_store[(qi, ci)] = rec             # [L,T]
+            del out
+            torch.cuda.empty_cache()
+        if (qi + 1) % 10 == 0 or qi == 0:
+            print(f"  [A {qi+1}/{len(ds)}]", flush=True)
+    del model
+    torch.cuda.empty_cache()
+
+    # ── Phase B: KVzip importance (patches attention, but we are done capturing) ──
+    from cacheblend.compress.kvzip import KVzipBackend, KVzipConfig
+    os.environ["COMPBLEND_KVZIP_NO_SYS_PROMPT"] = "1"
+    backend = KVzipBackend(MODEL, KVzipConfig(kv_type="retain"))
 
     # per-layer accumulators
     sink_attn_pct = [[] for _ in range(n_layers)]   # percentile of first-K tokens by attn-received
@@ -89,48 +121,35 @@ def main() -> int:
     cover = [[] for _ in range(n_layers)]           # frac of top-attn tokens in top-imp (per layer)
     cover_meanimp = []                              # coverage using mean-over-layer importance
 
-    bos = tok.bos_token_id
-    for qi, ex in enumerate(ds):
-        docs, qp = build_qa_prompt(ex, QUERY_PROMPT)
-        # per-chunk token id lists (doc chunks only — the compressed reusable context)
-        chunk_ids = [tok(d, add_special_tokens=False)["input_ids"] for d in docs]
-        for ids in chunk_ids:
-            T = len(ids)
-            if T < SINK_K + 4:
+    for qi, chunk_ids in enumerate(chunks_per_q):
+        for ci, ids in enumerate(chunk_ids):
+            if (qi, ci) not in recv_store:
                 continue
-            ids_t = torch.tensor([ids], dtype=torch.long, device=device)
-            # importance (KVzip, isolated)
+            T = len(ids)
+            ids_t = torch.tensor([ids], dtype=torch.long, device="cuda")
             imp = backend.score(ids_t).importance.to("cpu")     # [L,Hkv,T]
             imp_LT = head_reduce(imp, REDUCE)                    # [L,T]
-            # attention-received (eager, isolated)
-            with torch.inference_mode():
-                out = model(input_ids=ids_t, output_attentions=True, use_cache=False)
-            attns = out.attentions                              # tuple L of [1,H,T,T]
+            recv_LT = recv_store[(qi, ci)]                       # [L,T] (Phase A)
             sink = list(range(min(SINK_K, T)))
             imp_meanlayer = imp_LT.mean(0)                       # [T]
             for li in range(n_layers):
-                a = attns[li][0].float()                        # [H,Tq,Tk]
-                recv = a.sum(1).mean(0).cpu()                   # [Tk] attention received
+                recv = recv_LT[li]
                 ra = rank01(recv); ri = rank01(imp_LT[li])
                 sink_attn_pct[li].append(float(ra[sink].mean()))
                 sink_imp_pct[li].append(float(ri[sink].mean()))
                 body = [t for t in range(T) if t not in sink]
                 body_attn_pct[li].append(float(ra[body].mean()))
-                # spearman ~ pearson of ranks
                 corr[li].append(float(np.corrcoef(ra.numpy(), ri.numpy())[0, 1]))
-                # coverage: top-q by attn-received captured by top-q by importance
                 k = max(1, int(T * TOPQ))
                 top_a = set(torch.topk(recv, k).indices.tolist())
                 top_i = set(torch.topk(imp_LT[li], k).indices.tolist())
                 cover[li].append(len(top_a & top_i) / len(top_a))
-            # coverage of sinks by mean-layer importance top-q
             k = max(1, int(T * TOPQ))
             top_i_mean = set(torch.topk(imp_meanlayer, k).indices.tolist())
             cover_meanimp.append(len(set(sink) & top_i_mean) / len(sink))
-            del attns, out
             torch.cuda.empty_cache()
         if (qi + 1) % 10 == 0 or qi == 0:
-            print(f"  [{qi+1}/{len(ds)}]", flush=True)
+            print(f"  [B {qi+1}/{len(ds)}]", flush=True)
 
     def m(x):
         return float(np.mean(x)) if x else float("nan")
